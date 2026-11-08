@@ -1,0 +1,15 @@
+{
+  "name": "Preset Vault",
+  "version": "1.0.0",
+  "contactEmailAddress": "silentlydev@gmail.com",
+  "hasSettingsIcon": true,
+  "hasRibbonIcon": true,
+  "requiredDependencies": {
+    "prettyui": 6398181
+  },
+  "optionalDependencies": {},
+  "requiredPermissions": [],
+  "optionalPermissions": [
+    "trackingAccess"
+  ]
+}
