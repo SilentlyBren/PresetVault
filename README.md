@@ -26,7 +26,7 @@ the problem this solves.
 Enable **PrettyUI** and **Preset Vault** in your client's plugin manager.
 PrettyUI is required; Preset Vault will not load without it.
 
-For a manual installation, create a `PresetVault` folder in your client's
+Manual installation, create a `PresetVault` folder in your client's
 development plugins directory and copy `main.lua`, `plugin.json`, `core/` and
 `ui/` from this repository into it:
 
@@ -41,7 +41,7 @@ plugins/
 
 Install PrettyUI separately. No build step is needed.
 
-## Use it
+## Vault away
 
 1. Open the vault from the plugin's ribbon icon.
 2. Click **Save preset** to capture what you are currently wearing and carrying.
@@ -58,7 +58,7 @@ items or add bank storage.
 To share a preset, open it and use the share button in its title bar. Anyone can
 paste the resulting code into their own Import Code window.
 
-## Settings and troubleshooting
+## Settings / Troubleshoot
 
 The settings panel has four tabs: **General**, **Interface**, **Permissions**
 and **Danger Zone**. Interface covers categories, icon alignment, alphabetical
