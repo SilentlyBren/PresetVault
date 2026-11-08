@@ -15,6 +15,10 @@ local playSfx = uikit.PlaySfx
 local centreTitle, syncWindowChrome = uikit.CentreTitle, uikit.SyncWindowChrome
 
 local ICON_SWAP_SFX = 60742 -- plays when an icon is picked (incl. "No icon")
+-- The page-swap buttons share the notch the buttons that OPEN this window
+-- play, so stepping in and out of the custom page sounds like the same
+-- family of action.
+local CLICK_SFX = uikit.CLICK_SFX
 
 local BORDER, TITLE_H = 8, 32 -- PrettyUI Window chrome metrics
 
@@ -64,8 +68,9 @@ local function ensurePicker()
   centreTitle(picker.win)
   local body = picker.win.content
 
-  -- One shared hover highlight, layered ON TOP of the icons (some icons
-  -- out-drew an underlay) and slightly oversized so it reads as a glow.
+  -- One shared hover highlight, layered ON TOP of the icons - an underlay
+  -- is lost behind the denser skill art - and oversized by HL_PAD on each
+  -- side so it reads as a glow around the cell.
   local HL_PAD = 3
   local highlight = ui.Sprite.new(body)
   highlight:SetSize(CELL_P - 4 + HL_PAD * 2, CELL_P - 4 + HL_PAD * 2)
@@ -209,12 +214,14 @@ local function ensurePicker()
 
   -- ---- bottom rows (one per page, same geometry) ----
   local customBtn = prettyui.SimpleButton.new(body, "Custom", function()
+    playSfx(CLICK_SFX)
     local okC, errC = pcall(function() picker.SetMode(true) end)
     if not okC then log(formatStr("[PV] custom page failed: {}", tostring(errC))) end
   end, { x = PX + 2, y = rowY, height = 24 })
   gridParts[#gridParts + 1] = customBtn.root
 
   local backBtn = prettyui.SimpleButton.new(body, "Back", function()
+    playSfx(CLICK_SFX)
     local okB, errB = pcall(function() picker.SetMode(false) end)
     if not okB then log(formatStr("[PV] custom back failed: {}", tostring(errB))) end
   end, { x = PX + 2, y = rowY, height = 24 })

@@ -321,8 +321,9 @@ M.Encode = function(preset)
   local crc = crc16(payload)
   local body = payload .. string.char((crc >> 8) & 0xFF, crc & 0xFF)
 
-  -- No hyphen grouping. It cost 10% of the code's length and only ever
-  -- helped someone retyping one by hand, which is not how these travel.
+  -- One hyphen, after the prefix, and none inside the body: codes travel by
+  -- copy and paste, so grouping would only add length. The decoder strips
+  -- hyphens anyway, so a grouped code still imports.
   return M.PREFIX .. M.VERSION .. "-" .. base64Encode(body)
 end
 

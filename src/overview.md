@@ -4,7 +4,7 @@ An unlimited gear/inventory preset manager. A preset is a snapshot of worn
 equipment, backpack and, when one is carrying, Beast of Burden contents.
 The headline feature filters the open bank down to a preset's items as
 natively clickable slots - the plugin displays and organises; every
-withdrawal is the player's own click. 
+withdrawal is the player's own click.
 
 ## Layout
 
@@ -62,6 +62,3 @@ The plugin requests one optional permission, `trackingAccess`, used only
 for per-character vaults. The tracking id is a local storage key - never
 displayed, never written into a preset, never transmitted. The plugin
 makes no network calls.
-
-## AI usage
-Claude Fable 5.1 was used in this project's phase workflows.

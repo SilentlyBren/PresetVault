@@ -1062,7 +1062,7 @@ M.Show = function(preset, isRebuild)
     rearmPending = true
   end)
   if not ok then
-    log(formatStr("[PV] v2 show failed: {}", tostring(err)))
+    log(formatStr("[PV] bank view failed: {}", tostring(err)))
     M.Restore()
     return false
   end

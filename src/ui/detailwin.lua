@@ -66,8 +66,9 @@ local WORN_ICON_W, WORN_ICON_H = 32, 32
 local WORN_ICON_DX, WORN_ICON_DY = 4, 4
 local SLOT_BG_SPRITE = prettyui.Sprites.ITEM_SLOT_BACKGROUND
 
--- Item names hover as TOOLTIPS, not an in-window readout line: long names
--- (augmented/charged gear) overflowed the window width.
+-- Item names hover as TOOLTIPS rather than filling an in-window readout
+-- line, which the window is too narrow for: augmented and charged gear
+-- names run well past its width.
 local function detailSlotHover(slot, body)
   slot.bg.clickthrough = false
   attachDelayedTooltip(slot.bg, function()
@@ -78,8 +79,8 @@ local function detailSlotHover(slot, body)
   end, body)
 end
 
--- size defaults to the native 36x36 slot with 32x30 art inset +2 (the
--- backpack grid passes its own square geometry).
+-- Geometry defaults to a 40px box with 32x32 art inset 4; both callers
+-- pass an inset of 5 instead (see WORN_LAYOUT and the pack grid).
 local function makeDetailSlot(body, x, y, placeholderSprite, box, iw, ih, dx, dy)
   box = box or WORN_SLOT
   iw, ih = iw or WORN_ICON_W, ih or WORN_ICON_H
@@ -305,8 +306,8 @@ local function ensureDetail()
       line.clickthrough = true
     end
     for _, spec in ipairs(WORN_LAYOUT) do
-      -- art inset +5 rather than the grid's +4: the doll's slot art reads
-      -- a pixel high and left against this backdrop
+      -- art inset 5, not the default 4: the slot art reads a pixel high
+      -- and left against this backdrop
       detail.wornSlots[spec.idx] =
         makeDetailSlot(body, DOLL_X + spec.x, DOLL_Y + spec.y, spec.ph,
           WORN_SLOT, WORN_ICON_W, WORN_ICON_H, WORN_ICON_DX + 1, WORN_ICON_DY + 1)
@@ -357,7 +358,7 @@ local function ensureDetail()
     for i = 1, 32 do
       local col = (i - 1) % 7
       local row = math.floor((i - 1) / 7)
-      -- Doll geometry, except the icon inset: +1 on both axes here.
+      -- Same geometry and art inset as the doll slots above.
       detail.packSlots[i] = makeDetailSlot(body, PX + col * SLOT, PY + 320 + row * SLOT,
         nil, nil, nil, nil, WORN_ICON_DX + 1, WORN_ICON_DY + 1)
       if i > 28 then
@@ -368,9 +369,9 @@ local function ensureDetail()
     -- Share button, far left of the title bar, mirroring the close button
     -- on the right: a bare ui.Sprite on the window ROOT, swapping art on
     -- hover. applyTitleInset keeps the drag handle off it.
-    -- Raw child on the window ROOT (a managed control): under 1.3 auto
-    -- allocation that must go through the guarded constructor; raw fallback
-    -- keeps 1.2 working until the live PrettyUI catches up.
+    -- A raw child on the window ROOT is a managed control, so it goes
+    -- through PrettyUI's guarded constructor where that exists (1.3 auto
+    -- allocation); the direct ui.Sprite.new is the fallback for 1.2.
     detail.shareBtn = prettyui.NewComponent
         and prettyui.NewComponent(ui.Sprite, w.root)
         or ui.Sprite.new(w.root)

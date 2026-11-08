@@ -23,8 +23,8 @@ local iconwin = require("ui/iconwin")
 local detailwin = require("ui/detailwin")
 
 -- Shared plumbing lives in ui/uikit (sounds, the one-tooltip-per-window
--- system, window-chrome repairs); aliased locally so the call sites read
--- as they always did.
+-- system, window-chrome repairs), aliased locally to keep the call sites
+-- below short.
 local playSfx, playRandomSfx = uikit.PlaySfx, uikit.PlayRandomSfx
 local centreTitle, syncWindowChrome = uikit.CentreTitle, uikit.SyncWindowChrome
 local setButtonSprites = uikit.SetButtonSprites
@@ -145,7 +145,7 @@ local commitRename -- commits an in-progress category rename (set with the pair)
 local ghost -- the single drag ghost (SimpleButton, hidden when idle)
 local selectedId = nil -- preset whose detail window is open (row highlight)
 local editingCat = nil
-local editMode = false -- rename/delete buttons + drag-to-rearrange only when on (persisted)
+local editMode = false -- rename/delete buttons + drag-to-rearrange only when on
 local dropZones = {}
 local rowZones = {} -- { id, y0, y1 } per rendered preset row, for reordering
 local saveBtn, searchField -- top bar pair: exactly one of them is visible
@@ -363,7 +363,7 @@ local function startDrag(slot)
   pcall(function() g.root:MoveToFront() end) -- ghost above the capture
 end
 
--- Per-tick while a drag is live; called from the pvTipTick Logic handler.
+-- Per-tick while a drag is live; called from the pvWindowDrag ticker.
 dragTick = function()
   if not drag then return end
   pcall(function()
@@ -1524,8 +1524,8 @@ local function buildWindow(parent, x, y)
     attachDelayedTooltip(searchBtn.root, "Search presets")
 
     -- Import: far right of the cluster. Opens a box to paste a share code
-    -- into; the decoded preset lands in this vault keeping its own name,
-    -- category and icon (store.Import).
+    -- into; the decoded preset lands in this vault keeping its own name and
+    -- icon, in Uncategorised (codes carry no category - store.Import).
     importBtn = prettyui.SimpleButton.new(win.content, IMPORT_SPRITE, function()
       playSfx(CLICK_SFX)
       local okI, errI = pcall(sharewin.OpenImport)

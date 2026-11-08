@@ -7,11 +7,11 @@
 -- or the setting is off.
 --
 -- Core IS an optional dependency and the dev manifest declares it as one.
--- Detection is runtime in both builds: the client-injected global while that
--- declaration is live, otherwise the shared API global Core publishes for
+-- Detection is runtime in both builds, against two globals: the
+-- client-injected `bankcore` while that manifest declaration is live, and
+-- otherwise `__bankcore_api`, the shared API global Core publishes for
 -- exactly this purpose. Either way integration lights up for players who
--- have Core and stays silent for players who do not. The DEPENDENCY NOTE
--- below covers which global applies to which build, and why.
+-- have Core and stays silent for players who do not.
 local M = {}
 
 local EXT_ID = "presetvault"

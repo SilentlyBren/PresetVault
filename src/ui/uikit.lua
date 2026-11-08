@@ -1,5 +1,12 @@
--- Shared UI plumbing: interface sounds, the per-window tooltip, the Logic
--- tick that drives all time-based UI, and PrettyUI chrome repairs.
+-- Shared UI plumbing, served to every ui/ module:
+--   * interface sounds, silenced as one by the sfx setting
+--   * the per-window delayed tooltip and the instant blocked-action hint
+--   * the single Logic-tick heartbeat that drives all time-based UI
+--   * PrettyUI chrome repairs: title centring, drag-handle insets,
+--     satellite placement, the search field's clear button
+--   * the name-search matcher both list surfaces share
+--   * the bank-engine reads both engines share: obj names, bank
+--     components, op lists, the smallest available body font
 local M = {}
 
 -- ---- interface sounds ---------------------------------------------------

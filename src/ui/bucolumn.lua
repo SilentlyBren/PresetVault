@@ -928,7 +928,7 @@ end
 local function placeChrome(ctx)
   local vw, vh = viewBounds(ctx)
   -- Flush against the rows: the border line sits ONE pixel outside the
-  -- view, no standoff (the earlier 4px inset read as a stray buffer).
+  -- view, with no inset, so the frame reads as the list's own edge.
   pcall(function()
     col.frame:SetPos(PAD, VIEW_Y - 1)
     col.frame:SetSize(ctx.width - PAD * 2, vh + 2)
@@ -1044,9 +1044,9 @@ local function mount(ctx)
   -- components live on Core's layer, so THAT is the tip's parent (same
   -- coordinate space - uikit's rule). The window's wording, verbatim.
   uikit.AttachDelayedTooltip(col.plusBtn.root, "New category", ctx.parent)
-  -- Import keeps its WINDOW (the "Import category as well" checkbox lives
-  -- there) - the one deliberate window in the integrated UI. Icon 29456,
-  -- the same art as the standalone window's import button.
+  -- Import keeps its WINDOW - the one deliberate window in the integrated
+  -- UI, since a code has to be pasted somewhere. Icon 29456, the same art
+  -- as the standalone window's import button.
   col.impBtn = prettyui.SimpleButton.new(ctx.parent, 29456, function()
     pcall(window.OpenImport)
   end, { size = SIDE_BTN_W, iconSize = 16, categoryID = "auto" })
@@ -1067,9 +1067,8 @@ local function mount(ctx)
     scrollable = true, scrollStep = ROW_H,
   })
   placeChrome(ctx)
-  -- The scrollbar keeps its STOCK art: now that rows stop short of the
-  -- bar's lane rather than running beneath it, the track covers no content,
-  -- so there is nothing to restyle around.
+  -- The scrollbar keeps its STOCK art: rows stop short of the bar's lane
+  -- (see `inner` in render), so the track never covers content.
   local body = col.view.content
   for i = 1, window.NOTICE_LINES do
     local t = ui.Text.new(body)

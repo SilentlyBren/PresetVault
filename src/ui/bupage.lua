@@ -29,7 +29,10 @@ local SHORTFALL_FONT, SHORTFALL_FONT_H = uikit.SmallFont()
 local drawing = nil -- { model, bySrc } for the CURRENT Core drawing
 local counts = {} -- inv 95 totals, refreshed by the live layer
 local carried = {} -- inv 93 + 94 + 530 totals
-local pending = {} -- srcObj -> { amount, tick }: unconfirmed clicks
+-- Unconfirmed clicks: srcObj -> { amount, tick, snap, bySect }, where `snap`
+-- is the snapshot obj served (it differs from the key for noted items) and
+-- `bySect` splits the amount across the sections clicked.
+local pending = {}
 local tickCount = 0
 local forceTicks = 0
 local running = false
@@ -210,10 +213,10 @@ local function stepFlags()
     local live = (c.srcObj ~= nil) and (counts[c.srcObj] or 0) or 0
     local want = P.ChooseOp(entry.map, cellRemaining(c), live,
       model.equipObjs[c.obj] == true, c.stacked)
-    -- This engine NEVER flags Examine: Core redraws and re-parks through
-    -- every withdrawal, and an Examine flag riding those transitions made
-    -- the left-click label churn before settling. Native defaults rule
-    -- here; satisfied cells rely on the dim and the player.
+    -- This engine NEVER flags Examine. Core redraws and re-parks through
+    -- every withdrawal, so a flag that changed across those transitions
+    -- would churn the left-click label before settling. Native defaults
+    -- rule here; satisfied cells rely on the dim and the player.
     if want ~= nil and want == entry.map.examine then want = nil end
     pcall(function()
       local oc = child.opConfig
@@ -612,9 +615,9 @@ M.Draw = function(view)
   local bySrc = {}
   -- Per-unit split groups bind NON-CONSUMED cells first, consumed cells
   -- LAST: Core assigns stacks by occurrence over its stocked-first
-  -- grouping (PouchProbe-verified), so the placeholders land under
-  -- exactly the cells the player withdrew from - the clicked cell dims,
-  -- matching the standalone engine's sticky claims.
+  -- grouping, so the placeholders land under exactly the cells the player
+  -- withdrew from - the clicked cell dims, matching the standalone
+  -- engine's sticky claims.
   local perUnitGroups = {}
   for _, c in ipairs(model.cells) do
     local s = ui.Sprite.new(view.parent)
