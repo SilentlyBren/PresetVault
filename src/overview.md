@@ -6,8 +6,6 @@ The headline feature filters the open bank down to a preset's items as
 natively clickable slots - the plugin displays and organises; every
 withdrawal is the player's own click. 
 
-Claude Fable 5.1 had a strong hand in this project's phase workflows.
-
 ## Layout
 
 - `main.lua` - entry point: lifecycle, event wiring, window visibility.
@@ -64,3 +62,6 @@ The plugin requests one optional permission, `trackingAccess`, used only
 for per-character vaults. The tracking id is a local storage key - never
 displayed, never written into a preset, never transmitted. The plugin
 makes no network calls.
+
+## AI usage
+Claude Fable 5.1 was used in this project's phase workflows.
