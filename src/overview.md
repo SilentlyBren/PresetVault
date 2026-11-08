@@ -62,3 +62,6 @@ The plugin requests one optional permission, `trackingAccess`, used only
 for per-character vaults. The tracking id is a local storage key - never
 displayed, never written into a preset, never transmitted. The plugin
 makes no network calls.
+
+## AI usage
+Claude Fable 5.1 was used in this project's phase workflows.
