@@ -39,8 +39,6 @@ plugins/
     ui/
 ```
 
-Install PrettyUI separately. No build step is needed.
-
 ## Vault away
 
 1. Open the vault from the plugin's ribbon icon.
@@ -61,7 +59,7 @@ paste the resulting code into their own Import Code window.
 ## Settings / Troubleshoot
 
 The settings panel has four tabs: **General**, **Interface**, **Permissions**
-and **Danger Zone**. Interface covers categories, icon alignment, alphabetical
+and **Danger Zone**. General and Interface covers categories, icon alignment, alphabetical
 locking, the discrepancy overlay, the wrong-slot guide, exact preset layout in
 the bank and an option to disable interface sounds. Danger Zone holds the full
 reset, which clears every character's vault and restores defaults.
