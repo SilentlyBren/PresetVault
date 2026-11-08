@@ -7,7 +7,9 @@
   "requiredDependencies": {
     "prettyui": 6398181
   },
-  "optionalDependencies": {},
+  "optionalDependencies": {
+    "bankcore": 6464293
+  },
   "requiredPermissions": [],
   "optionalPermissions": [
     "trackingAccess"
