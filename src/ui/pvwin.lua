@@ -70,6 +70,15 @@ local ARROW_COLLAPSED_DEG = 270 -- anticlockwise 270 = 90 clockwise: up -> right
 local ARROW_EXPANDED_DEG = 180 -- half turn: up -> down
 local ARROW_SIZE = 16
 local ARROW_PAD = 4 -- chevron inset from the row's right edge
+-- Preview cell: the end of a preset row, closed off by a hairline.
+local VIEW_CELL_W = 30
+local VIEW_DIV_INSET = 0 -- hairline shortfall top and bottom
+local VIEW_DIV_RGBA = 0xD7D0BF26
+local VIEW_HOVER_RGBA = 0xD7D0BF1E
+local VIEW_OPEN_RGBA = 0xD2A84D40
+local VIEW_GLYPH_SIZE = 20
+local VIEW_SPRITE, VIEW_SPRITE_LIT = 6247, 6247
+local VIEW_GLYPH_DIM = 0.78 -- glyph alpha at rest
 -- Headers and rows share one MUSEO face - a step up from bucolumn's
 -- smallest, since the window has more room than the bank sidebar. Guarded
 -- like uikit.SmallFont: a missing enum reads -1, never nil.
@@ -467,11 +476,23 @@ local function applyRowLook(s)
     local fill = s.base or ROW_ODD
     if s.active then
       fill = ROW_SELECTED
-    elseif s.hovered then
+    elseif s.hovered or s.viewHovered then
       fill = ROW_HOVER
     end
     s.bg.rgba = fill
     s.border.hidden = not s.active
+  end)
+end
+
+-- Preview cell look: gold while this row's preview is open, light on hover.
+local function applyViewLook(s)
+  pcall(function()
+    local open = s.preset ~= nil and selectedId == s.preset.id
+    local lit = open or s.viewHovered == true
+    s.viewFill.rgba = open and VIEW_OPEN_RGBA or VIEW_HOVER_RGBA
+    s.viewFill.hidden = not lit
+    s.viewGlyph.spriteID = lit and VIEW_SPRITE_LIT or VIEW_SPRITE
+    s.viewGlyph.alpha = lit and 1.0 or VIEW_GLYPH_DIM
   end)
 end
 
@@ -486,6 +507,16 @@ local function ensureRowSlot(i)
   s.bg.fill = true
   s.bg.clickthrough = true
   s.bg.hidden = true
+  -- preview cell wash and hairline, under the selection border
+  s.viewFill = ui.Rectangle.new(body)
+  s.viewFill.fill = true
+  s.viewFill.clickthrough = true
+  s.viewFill.hidden = true
+  s.viewDiv = ui.Rectangle.new(body)
+  s.viewDiv.fill = true
+  s.viewDiv.rgba = VIEW_DIV_RGBA
+  s.viewDiv.clickthrough = true
+  s.viewDiv.hidden = true
   -- the thin far-left strip uniting a category's rows with their header
   s.accent = ui.Rectangle.new(body)
   s.accent.fill = true
@@ -596,15 +627,33 @@ local function ensureRowSlot(i)
   end)
   attachDrag(s, body) -- edit-mode drag surface, overlays the row
 
-  -- The bare eye opens/closes the preset preview (detail window) - a plain
-  -- sprite like the pencil and bin, no button frame. The hover art doubles
-  -- as the open-preview state (_pvActive holds it).
-  s.eyeBtn = prettyui.SpriteButton.new(body, "PENCIL", function()
-    -- behaviour shared with the BankUtil column's eye (M.ToggleDetail)
+  -- Preview cell: toggles the preset's detail window.
+  s.viewGlyph = ui.Sprite.new(body)
+  s.viewGlyph:SetSize(VIEW_GLYPH_SIZE, VIEW_GLYPH_SIZE)
+  s.viewGlyph.spriteID = VIEW_SPRITE
+  s.viewGlyph.clickthrough = true
+  s.viewGlyph.hidden = true
+  s.viewBtn = ui.Button.new(body)
+  s.viewBtn.alpha = 0
+  s.viewBtn.text.content = ""
+  s.viewBtn.hidden = true
+  s.viewBtn:Subscribe(ui.Hook.ONMOUSEOVER, function()
+    s.viewHovered = true
+    applyViewLook(s)
+    applyRowLook(s)
+    return true
+  end)
+  s.viewBtn:Subscribe(ui.Hook.ONMOUSELEAVE, function()
+    s.viewHovered = false
+    applyViewLook(s)
+    applyRowLook(s)
+    return true
+  end)
+  s.viewBtn:Subscribe(ui.Hook.ONCLICK, function()
     M.ToggleDetail(s.preset)
-  end, { size = 22, _onScrollWheel = win._onScrollWheel })
-  setButtonSprites(s.eyeBtn, 21346, 21347) -- RS3_WORLDMAP_ICON_OVERVIEW NML/OVR
-  attachDelayedTooltip(s.eyeBtn.root, "Preview this preset's contents")
+  end)
+  pcall(function() s.viewBtn:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", win._onScrollWheel) end)
+  attachDelayedTooltip(s.viewBtn, "Preview contents")
 
   s.delBtn = prettyui.SpriteButton.new(body, "TRASH", function()
     playSfx(CLICK_SFX)
@@ -636,7 +685,11 @@ local function hideRowSlot(s)
   s.icon.hidden = true
   s.text.hidden = true
   s.btn.hidden = true
-  s.eyeBtn.root.hidden = true
+  s.viewHovered = false
+  s.viewFill.hidden = true
+  s.viewDiv.hidden = true
+  s.viewGlyph.hidden = true
+  s.viewBtn.hidden = true
   s.delBtn.root.hidden = true
 end
 
@@ -1223,8 +1276,8 @@ relayout = function()
           end
         end
 
-        -- Right-side reserve: just the eye normally, eye + bin in edit mode.
-        local reserve = editMode and 64 or 30
+        -- Right-side reserve: the preview cell, plus the bin in edit mode.
+        local reserve = editMode and (VIEW_CELL_W + 28) or VIEW_CELL_W
         s.text.hidden = false
         s.text:SetPos(nameX, y)
         s.text:SetSize(math.max(40, listW - nameX - reserve), ROW_H)
@@ -1242,15 +1295,24 @@ relayout = function()
           or bankpage.activePresetId) == p.id
         applyRowLook(s)
 
-        s.eyeBtn.root.hidden = false
-        -- The eye takes the row's corner slot; edit mode slides it left to
-        -- make way for the bin. 22px, placed so its centre matches the
-        -- neighbouring 20px and 24px button columns.
-        s.eyeBtn.root:SetPos(editMode and (listW - 59) or (listW - 27), y + 4)
-        s.eyeBtn._pvActive = selectedId == p.id -- bright while its preview is open
-        pcall(function() s.eyeBtn:_UpdateState() end)
+        -- preview cell: wash and glyph right of the hairline
+        local cellX = listW - VIEW_CELL_W
+        s.viewDiv.hidden = false
+        s.viewDiv:SetPos(cellX, y + VIEW_DIV_INSET)
+        s.viewDiv:SetSize(1, ROW_H - VIEW_DIV_INSET * 2)
+        s.viewFill:SetPos(cellX + 1, y)
+        s.viewFill:SetSize(VIEW_CELL_W - 1, ROW_H)
+        s.viewGlyph.hidden = false
+        s.viewGlyph:SetPos(
+          cellX + 1 + math.floor((VIEW_CELL_W - 1 - VIEW_GLYPH_SIZE) / 2),
+          y + math.floor((ROW_H - VIEW_GLYPH_SIZE) / 2))
+        s.viewBtn.hidden = false
+        s.viewBtn:SetPos(cellX, y)
+        s.viewBtn:SetSize(VIEW_CELL_W, ROW_H)
+        applyViewLook(s)
+        -- edit mode: the bin sits just left of the hairline
         s.delBtn.root.hidden = not editMode
-        if editMode then s.delBtn.root:SetPos(listW - 26, y + 5) end
+        if editMode then s.delBtn.root:SetPos(cellX - 24, y + 5) end
         -- Reorder target: the band this row occupies, in the same scrolled
         -- content coords as dropZones.
         rowZones[#rowZones + 1] = { id = p.id, y0 = y, y1 = y + ROW_H }
@@ -1690,7 +1752,7 @@ local function ensureHost()
   return true
 end
 
--- The row eye button's behaviour: open or close a preset's detail window.
+-- The row preview cell's behaviour: open or close a preset's detail window.
 M.ToggleDetail = function(preset)
   if preset == nil then return end
   if not ensureHost() then return end
