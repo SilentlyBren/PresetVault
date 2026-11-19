@@ -43,9 +43,6 @@ local SKILLS = {
   { "Invention", 26541 }, { "Archaeology", 10782 },
 }
 
--- The share format's icon ceiling (sharecode's MAX_ICON): int32 max.
-local MAX_CUSTOM_ICON = 0x7FFFFFFF
-
 local picker -- { win } the picker window, built once
 local pickerApply = nil -- the commit callback (receives icon id or nil)
 
@@ -139,15 +136,12 @@ local function ensurePicker()
   local bodyW = pw - BORDER * 2
 
   -- ---- custom page: label, id box, centred preview, Back / Set Icon ----
-  -- Accepts a plain integer sprite id within the shareable range, or nil.
+  -- The typed sprite id, or nil when it is not one that may be drawn.
   local customField, customPreview
   local function typedId()
     local n = nil
-    pcall(function() n = tonumber(customField:GetText()) end)
-    if n == nil or n ~= math.floor(n) or n < 0 or n > MAX_CUSTOM_ICON then
-      return nil
-    end
-    return math.floor(n)
+    pcall(function() n = store.CleanIcon(customField:GetText()) end)
+    return n
   end
 
   local customLabel = ui.Text.new(body)
@@ -163,7 +157,7 @@ local function ensurePicker()
   customField = prettyui.TextField.new(body, {
     x = PX, y = PY + 24,
     width = bodyW - PX * 2,
-    maxLength = 10, -- MAX_CUSTOM_ICON (int32 max) is 10 digits
+    maxLength = 10, -- the largest sprite id (int32 max) is 10 digits
     -- Live preview: the sprite swaps in as the id is typed, and hides
     -- again the moment the box holds anything unusable.
     onChange = function()

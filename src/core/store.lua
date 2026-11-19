@@ -42,6 +42,20 @@ M.CleanName = function(s)
   return string.sub(s, 1, MAX_NAME)
 end
 
+local MAX_ICON = 0x7FFFFFFF -- the share format's icon ceiling
+
+-- Sprite ids that crash the client when drawn.
+local UNSAFE_ICONS = { [1243] = true }
+
+-- Returns the icon as a whole sprite id, or nil when it must not be drawn.
+M.CleanIcon = function(iconId)
+  local n = tonumber(iconId)
+  if n == nil or n ~= math.floor(n) or n < 0 or n > MAX_ICON then return nil end
+  n = math.floor(n)
+  if UNSAFE_ICONS[n] then return nil end
+  return n
+end
+
 local function idxKey(scope) return PREFIX .. "." .. scope .. ".idx" end
 local function presetKey(scope, id) return PREFIX .. "." .. scope .. ".p" .. id end
 
@@ -288,7 +302,7 @@ M.Import = function(preset)
     equipment = preset.equipment or {},
     backpack = preset.backpack or {},
   }
-  if preset.icon ~= nil then p.icon = preset.icon end
+  p.icon = M.CleanIcon(preset.icon)
   if preset.bob ~= nil then p.bob = preset.bob end
   return addPreset(p)
 end
@@ -334,6 +348,7 @@ end
 
 -- Sets the sprite id shown beside the preset's name; nil clears it.
 M.SetIcon = function(presetId, iconId)
+  iconId = M.CleanIcon(iconId)
   editPreset(presetId, function(p) p.icon = iconId end)
 end
 
@@ -360,7 +375,7 @@ M.SetCategoryIcon = function(name, iconId)
   if idx == nil then return end
   for _, c in ipairs(idx.categories) do
     if c.name == name then
-      c.icon = iconId
+      c.icon = M.CleanIcon(iconId)
       break
     end
   end
