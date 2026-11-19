@@ -36,6 +36,12 @@ local MAX_NAME = 25 -- UI input fields enforce this too; clamp here as backstop
 
 local lastScope = nil -- avoids rewriting the label table on every single read
 
+-- Removes markup tags and angle brackets from a name, then clamps its length.
+M.CleanName = function(s)
+  s = tostring(s or ""):gsub("<[^<>]*>", ""):gsub("[<>]", "")
+  return string.sub(s, 1, MAX_NAME)
+end
+
 local function idxKey(scope) return PREFIX .. "." .. scope .. ".idx" end
 local function presetKey(scope, id) return PREFIX .. "." .. scope .. ".p" .. id end
 
@@ -275,8 +281,10 @@ end
 -- locked.
 M.Import = function(preset)
   if type(preset) ~= "table" then return nil end
+  local name = M.CleanName(preset.name)
+  if name == "" then name = "Untitled" end
   local p = {
-    name = string.sub(tostring(preset.name or "Untitled"), 1, MAX_NAME),
+    name = name,
     equipment = preset.equipment or {},
     backpack = preset.backpack or {},
   }
@@ -330,9 +338,9 @@ M.SetIcon = function(presetId, iconId)
 end
 
 M.Rename = function(presetId, newName)
-  editPreset(presetId, function(p)
-    p.name = string.sub(newName, 1, MAX_NAME)
-  end)
+  local name = M.CleanName(newName)
+  if name == "" then name = "Untitled" end
+  editPreset(presetId, function(p) p.name = name end)
 end
 
 -- ===========================================================================
@@ -444,9 +452,9 @@ end
 -- Renaming onto an existing category MERGES into it: the target record
 -- survives, adopting the source's icon only when it has none of its own.
 M.RenameCategory = function(old, new)
-  if new == nil or new == "" or new == old then return end
-  new = string.sub(new, 1, MAX_NAME)
-  if new == old then return end
+  if new == nil then return end
+  new = M.CleanName(new)
+  if new == "" or new == old then return end
   local presets, idx, s = loadAll()
   if presets == nil then return end
   local from, target

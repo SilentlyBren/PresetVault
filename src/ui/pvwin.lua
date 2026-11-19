@@ -927,8 +927,8 @@ local function ensureRenamePair()
       local old = editingCat
       editingCat = nil
       if old then
-        local newName = renameField:GetText()
-        if newName ~= nil and newName ~= "" and newName ~= old then
+        local newName = store.CleanName(renameField:GetText())
+        if newName ~= "" and newName ~= old then
           setCollapsed(newName, isCollapsed(old)) -- carry this session's state
           store.RenameCategory(old, newName)
         end

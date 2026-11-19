@@ -267,8 +267,9 @@ local function ensureDetail()
       onChange = function(_, _, content)
         local okR, errR = pcall(function()
           if not detailPreset then return end
-          local name = content
-          if name == nil or name == "" then name = "Untitled" end
+          local name = store.CleanName(content)
+          if name ~= content then detail.nameField:SetText(name) end
+          if name == "" then name = "Untitled" end
           store.Rename(detailPreset.id, name)
           detailPreset.name = name
           detail.win:SetTitle(name)

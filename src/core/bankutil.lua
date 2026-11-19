@@ -172,15 +172,6 @@ end
 -- reason. The active record is set BEFORE Open and rolled back on refusal.
 M.ShowPreset = function(preset)
   if ext == nil then return false, "inactive" end
-  -- Our own wrong-tab gate, BEFORE Core's: Core's Open gate trusts its
-  -- CACHED tab flag, which only player-driven tab clicks update - so after
-  -- the CLIENT switches tabs itself (a deposit landing in another tab's
-  -- placeholder) the stale cache lets Open succeed on the wrong tab, and
-  -- our structural tick then closes the view a tick later: the preset
-  -- flashes on and dies with no refusal chime or pulse. NativeViewAll is
-  -- the FRESH reading (GetBankState detects before consulting the cache);
-  -- nil means pre-1.5 Core, where Core's own gate is all there is.
-  if M.NativeViewAll() == false then return false, "not_all_items" end
   local prevId, prevPreset = activeId, activePreset
   activeId, activePreset = preset.id, preset
   local okOpen, why = false, nil
@@ -211,17 +202,6 @@ M.GetBankItems = function()
   local items = nil
   pcall(function() items = ext:GetBankItems() end)
   return items
-end
-
--- Core's own "native All Items tab is selected" reading, or nil when Core
--- cannot answer (pre-1.5 Core has no GetBankState, or the call fails) - the
--- caller then falls back to its own BANK_3 read.
-M.NativeViewAll = function()
-  if ext == nil or ext.GetBankState == nil then return nil end
-  local state = nil
-  pcall(function() state = ext:GetBankState() end)
-  if type(state) ~= "table" then return nil end
-  return state.viewAll == true
 end
 
 -- True when Core reports a native bank search OR filter is active; nil when

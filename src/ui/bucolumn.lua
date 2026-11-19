@@ -1107,8 +1107,8 @@ local function mount(ctx)
     col.renameFor = nil
     if oldCat ~= nil then
       pcall(function()
-        local newName = col.rename:GetText()
-        if newName ~= nil and newName ~= "" and newName ~= oldCat then
+        local newName = store.CleanName(col.rename:GetText())
+        if newName ~= "" and newName ~= oldCat then
           -- carry this session's collapse state (pvwin.lua's rule)
           window.SetCollapsed(newName, window.IsCollapsed(oldCat))
           store.RenameCategory(oldCat, newName)
@@ -1116,9 +1116,9 @@ local function mount(ctx)
       end)
     elseif presetId ~= nil then
       pcall(function()
-        local newName = col.rename:GetText()
+        local newName = store.CleanName(col.rename:GetText())
         -- blank falls back to "Untitled" - the window's rename rule
-        if newName == nil or newName == "" then newName = "Untitled" end
+        if newName == "" then newName = "Untitled" end
         store.Rename(presetId, newName)
       end)
     end

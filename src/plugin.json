@@ -1,15 +1,14 @@
 {
   "name": "Preset Vault",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "contactEmailAddress": "silentlydev@gmail.com",
   "hasSettingsIcon": true,
   "hasRibbonIcon": true,
   "requiredDependencies": {
-    "prettyui": 6398181
-  },
-  "optionalDependencies": {
+    "prettyui": 6398181,
     "bankcore": 6464293
   },
+  "optionalDependencies": {},
   "requiredPermissions": [],
   "optionalPermissions": [
     "trackingAccess"

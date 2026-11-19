@@ -79,10 +79,6 @@ local function onAllItemsTab()
   if hi == nil then return true end
   return hi == 0x88
 end
--- The Core engine (ui/bupage) needs the same read: Core 1.1.0 misses
--- CLIENT-initiated tab switches (deposit into another tab's placeholder),
--- so our integrated view bails on this var exactly like the panel engine.
-M.OnAllItemsTab = onAllItemsTab
 
 -- True when a native bank search or filter is active. Both re-filter the
 -- grid, so a live view's claims stop lining up with what is shown.

@@ -18,7 +18,6 @@ local M = {}
 local P = require("core/presetview")
 local invread = require("core/invread")
 local uikit = require("ui/uikit")
-local bankpage = require("ui/bankpage") -- OnAllItemsTab (the shared tab read)
 local bankutil = require("core/bankutil")
 
 local BANK_INV_STATIC = 201 -- the 1920-slot grid: where Core's moved stacks live
@@ -341,15 +340,6 @@ local function onTick()
     if structural then
       if bankutil.ActivePresetId() == nil then
         M.Stop()
-        return
-      end
-      -- Close our view the moment the All Items tab is gone, exactly as
-      -- the panel engine does. Prefer Core's own tab reading, falling back
-      -- to our BANK_3 heuristic when Core cannot answer.
-      local viewAll = bankutil.NativeViewAll()
-      if viewAll == nil then viewAll = bankpage.OnAllItemsTab() end
-      if not viewAll then
-        pcall(bankutil.Hide)
         return
       end
       -- Close the view when the player starts a native search or filter.
