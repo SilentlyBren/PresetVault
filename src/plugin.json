@@ -5,10 +5,11 @@
   "hasSettingsIcon": true,
   "hasRibbonIcon": true,
   "requiredDependencies": {
-    "prettyui": 6398181,
+    "prettyui": 6398181
+  },
+  "optionalDependencies": {
     "bankcore": 6464293
   },
-  "optionalDependencies": {},
   "requiredPermissions": [],
   "optionalPermissions": [
     "trackingAccess"
