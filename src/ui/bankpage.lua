@@ -638,7 +638,7 @@ local function reclaimCell(i, c, grid)
     -- mouse or geometry errs toward re-parking (a wiggle recovers either
     -- way, and the sprite was never torn down so xyGlobal is settled)
     local m, sg = nil, nil
-    pcall(function() m = Mouse.GetPosition() end)
+    pcall(function() m = uikit.MousePos() end)
     pcall(function() sg = c.sprite.xyGlobal end)
     if m == nil or sg == nil
       or (m.x >= sg.x and m.x < sg.x + 36
@@ -752,7 +752,7 @@ local function onTick(event)
     if rearmPending then
       rearmPending = false
       pcall(function()
-        local m = Mouse.GetPosition()
+        local m = uikit.MousePos()
         if m == nil or hotIndex ~= nil then return end
         for i, c in ipairs(view.cells) do
           if c.child ~= nil and c.sprite ~= nil then

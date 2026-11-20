@@ -46,6 +46,55 @@ M.AddTicker = function(name, fn)
   tickers[name] = fn
 end
 
+local function interfaceScale()
+  local scale = 1
+  pcall(function()
+    local pct = tonumber(game.options.InterfaceScale.setting) or 100
+    if pct > 0 then scale = pct / 100 end
+  end)
+  return scale
+end
+
+local pointerScale = nil -- measured window-pixels-per-interface-unit
+local pointerScaleFor = nil -- the Interface Scale it was measured at
+
+-- Measures the pointer scale from a hook's component-relative coordinates.
+M.CalibratePointer = function(component, x, y)
+  if type(x) ~= "number" or type(y) ~= "number" then return end
+  local raw, origin = Mouse.GetPosition(), nil
+  pcall(function() origin = component.xyGlobal end)
+  if raw == nil or origin == nil then return end
+  local ex, ey = origin.x + x, origin.y + y
+  if ex < 32 or ey < 32 then return end
+  local sx, sy = raw.x / ex, raw.y / ey
+  if sx < 0.5 or sx > 4 or sy < 0.5 or sy > 4
+    or math.abs(sx - sy) > math.max(sx, sy) * 0.1 then
+    return
+  end
+  pointerScale = (ex >= ey) and sx or sy
+  pointerScaleFor = interfaceScale()
+end
+
+-- The pointer in interface coordinates, the space components are placed in.
+M.MousePos = function()
+  local m = Mouse.GetPosition()
+  if m == nil then return nil end
+  local scale = interfaceScale()
+  if pointerScale ~= nil and pointerScaleFor == scale then
+    scale = pointerScale
+  end
+  return { x = m.x / scale, y = m.y / scale }
+end
+
+-- Logs each distinct failure once per load.
+local reported = {}
+M.ReportOnce = function(where, err)
+  local key = where .. tostring(err)
+  if reported[key] then return end
+  reported[key] = true
+  log(formatStr("[PV] {} failed: {}", where, tostring(err)))
+end
+
 -- ---- shared delayed tooltip ------------------------------------------------
 -- One Tooltip per window content, retargeted and retexted per button after a
 -- hover dwell, rather than one tooltip per button.
@@ -239,6 +288,35 @@ M.MatchesSearch = function(name, query)
   end
   local pat = "^" .. q:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%1"):gsub("%*", ".*") .. "$"
   return string.find(n, pat) ~= nil
+end
+
+-- ---- drag-to-reorder plumbing ------------------------------------------------
+
+-- The drop gap for a pointer at content-y `y` among `rows` ({ id, y0, y1 },
+-- top to bottom): the rows either side of it and the y of the line between.
+-- `above` or `below` is nil at the ends; nil overall when `rows` is empty.
+M.GapAt = function(rows, y)
+  if #rows == 0 then return nil end
+  for i, r in ipairs(rows) do
+    if y < (r.y0 + r.y1) / 2 then
+      return { above = rows[i - 1], below = r, lineY = r.y0 }
+    end
+  end
+  local last = rows[#rows]
+  return { above = last, below = nil, lineY = last.y1 }
+end
+
+-- The preset id to hand store.ReorderPreset so `movedId` lands in the gap
+-- between `aboveId` and `belowId`, or nil when it already sits there.
+-- `orderIdx` is store.PresetOrderIndex().
+M.GapTarget = function(orderIdx, movedId, aboveId, belowId)
+  local m = orderIdx[movedId]
+  if m == nil then return nil end
+  local a = aboveId ~= nil and orderIdx[aboveId] or nil
+  local b = belowId ~= nil and orderIdx[belowId] or nil
+  if a ~= nil and m < a then return aboveId end
+  if b ~= nil and m > b then return belowId end
+  return nil
 end
 
 -- ---- shared bank-engine plumbing --------------------------------------------

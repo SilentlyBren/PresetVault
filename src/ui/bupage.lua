@@ -145,7 +145,7 @@ local function stepFlags()
   -- No pointer reading means no way to tell a park from a coincidence:
   -- hold no flags at all (native defaults still work) rather than risk one.
   local mouse = nil
-  pcall(function() mouse = Mouse.GetPosition() end)
+  pcall(function() mouse = uikit.MousePos() end)
   if mouse == nil then
     unflagAll()
     return

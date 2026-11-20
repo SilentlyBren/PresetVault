@@ -145,9 +145,10 @@ end
 -- ---- module state -----------------------------------------------------------
 local host -- the plugin build layer the windows live in
 local win -- prettyui.Window (main vault)
+local list -- prettyui.SimpleView: the scrolling preset list under the top bar
 local rowPool = {} -- reusable preset-row widget sets
 local headerPool = {} -- reusable category-header widget sets
-local hintPool = {} -- reusable "(drag presets here)" texts
+local hintPool = {} -- reusable empty-category hint texts
 local sepPool = {} -- reusable 1px card separators (see CARD_SEP_RGBA)
 local renameField, renameOk -- the single inline category-rename pair
 local commitRename -- commits an in-progress category rename (set with the pair)
@@ -155,8 +156,12 @@ local ghost -- the single drag ghost (SimpleButton, hidden when idle)
 local selectedId = nil -- preset whose detail window is open (row highlight)
 local editingCat = nil
 local editMode = false -- rename/delete buttons + drag-to-rearrange only when on
+-- One per category band, top to bottom: { cat, y0, y1, flat, headed, rows },
+-- rows = { id, y0, y1 } per rendered preset row. All in list content coords.
 local dropZones = {}
-local rowZones = {} -- { id, y0, y1 } per rendered preset row, for reordering
+local dragOrderIdx = {} -- store.PresetOrderIndex() as of the last relayout
+local dropLine -- the insertion line shown during a drag
+local lastListW = 0 -- row width of the last relayout (the line's width)
 local saveBtn, searchField -- top bar pair: exactly one of them is visible
 local searchClear -- the field's clear icon (uikit.AttachClearButton)
 local editBtn, searchBtn -- top bar toggles, reset when the window closes
@@ -223,25 +228,117 @@ local function ensureGhost()
   return ghost
 end
 
--- The mouse's Y in scrolled CONTENT coords (what drop zones are recorded in),
--- or nil when the cursor is outside the content column.
+-- The mouse's Y in the list's scrolled content coords (what drop zones are
+-- recorded in), or nil when the cursor is outside the visible list.
 local function contentMouseY()
-  local m = Mouse.GetPosition()
-  if not m or not win then return nil end
+  local m = uikit.MousePos()
+  if not m or not win or not list then return nil end
   local mx = m.x - (win.root.x + BORDER)
   if mx < 0 or mx > USABLE + SCROLLBAR_W then return nil end
-  local scrollY = (win._scroll and win._scroll.scrollY) or 0
-  return m.y - (win.root.y + TITLE_H) + scrollY
+  local ly = m.y - (win.root.y + TITLE_H + (list.root.y or 0))
+  if ly < 0 or ly >= (list.root.height or 0) then return nil end
+  return ly + (list.scrollY or 0)
 end
 
--- The category band under the mouse.
-local function zoneAtMouse()
+-- Where a drop of `slot` would land, or nil when it would change nothing.
+-- A category: { cat, below, lineY }. A preset: { setCat, target, lineY }.
+local function resolveDrop(slot)
   local my = contentMouseY()
   if my == nil then return nil end
-  for _, z in ipairs(dropZones) do
-    if my >= z.y0 and my < z.y1 then return z end
+  local zi, z
+  for i, zone in ipairs(dropZones) do
+    if my >= zone.y0 and my < zone.y1 then
+      zi, z = i, zone
+      break
+    end
   end
-  return nil
+  if z == nil then return nil end
+  if slot.header ~= nil then
+    local own = (slot.cat == UNCAT) and "" or slot.cat
+    if z.flat or z.cat == own then return nil end
+    local oi
+    for i, zone in ipairs(dropZones) do
+      if zone.cat == own then oi = i end
+    end
+    -- Uncategorised is pinned first, so a drop on it means "first after it".
+    local below = z.cat == "" or my >= (z.y0 + z.y1) / 2
+    if oi ~= nil and ((below and zi == oi - 1)
+      or (not below and zi == oi + 1)) then
+      return nil
+    end
+    return { cat = z.cat, below = below, lineY = below and z.y1 or z.y0 }
+  end
+  local p = slot.preset
+  if p == nil then return nil end
+  local catChange = not z.flat and (p.category or "") ~= z.cat
+  local underHeader = z.headed and (z.y0 + ROW_H) or z.y0
+  local gap = nil
+  if PersistentDB:GetBool("ui.lockAlpha") ~= true then
+    gap = uikit.GapAt(z.rows, my)
+  end
+  if gap == nil then
+    if not catChange then return nil end
+    return { setCat = z.cat, lineY = underHeader }
+  end
+  local aboveId = gap.above and gap.above.id or nil
+  local belowId = gap.below and gap.below.id or nil
+  if aboveId == p.id or belowId == p.id then return nil end
+  local target = uikit.GapTarget(dragOrderIdx, p.id, aboveId, belowId)
+  if target == nil and not catChange then return nil end
+  return { setCat = catChange and z.cat or nil, target = target,
+    lineY = gap.lineY }
+end
+
+local function applyDrop(slot, t)
+  if slot.header ~= nil then
+    if t.cat == "" then
+      store.ReorderCategory(slot.cat, "") -- "" target = first position
+    else
+      store.MoveCategory(slot.cat, t.cat, t.below)
+    end
+  else
+    if t.setCat ~= nil then
+      store.SetCategory(slot.preset.id, t.setCat) -- "" clears the category
+    end
+    if t.target ~= nil then store.ReorderPreset(slot.preset.id, t.target) end
+  end
+  playSfx(DROP_SFX)
+  relayout()
+end
+
+-- The 2px line marking where a drag would land.
+local function ensureDropLine()
+  if dropLine then return dropLine end
+  dropLine = ui.Rectangle.new(list.content)
+  dropLine:SetSize(math.max(1, lastListW), 2)
+  dropLine.fill = true
+  dropLine.rgba = SELECTED_BORDER
+  dropLine.clickthrough = true
+  dropLine.hidden = true
+  return dropLine
+end
+
+-- Scrolls the list a row at a time while a drag is held near its top or
+-- bottom edge.
+local EDGE_PX, EDGE_TICKS = 16, 6
+local lastEdgeScroll = -100
+local function edgeScroll(m)
+  if not m or not win or not list then return end
+  if (uikit.Now() - lastEdgeScroll) < EDGE_TICKS then return end
+  local mx = m.x - (win.root.x + BORDER)
+  if mx < 0 or mx > USABLE + SCROLLBAR_W then return end
+  local ly = m.y - (win.root.y + TITLE_H + (list.root.y or 0))
+  local h = list.root.height or 0
+  local dir = 0
+  if ly >= 0 and ly < EDGE_PX then
+    dir = -1
+  elseif ly >= h - EDGE_PX and ly < h then
+    dir = 1
+  end
+  if dir ~= 0 then
+    lastEdgeScroll = uikit.Now()
+    list:ScrollBy(dir * ROW_H)
+  end
 end
 
 -- True when the mouse currently sits inside a slot's own band (content
@@ -249,7 +346,7 @@ end
 local function mouseOnSurf(slot)
   local my = contentMouseY()
   if my == nil then return false end
-  local m = Mouse.GetPosition()
+  local m = uikit.MousePos()
   local mx = m.x - (win.root.x + BORDER)
   return mx >= (slot.surfX or 0)
     and mx <= (slot.surfX or 0) + (slot.surfW or 0)
@@ -261,7 +358,7 @@ end
 -- (icon picker, detail, share, import) - the edit-mode surfaces ignore the
 -- press stream then.
 local function mouseOverSatellite()
-  local m = Mouse.GetPosition()
+  local m = uikit.MousePos()
   if m == nil then return false end
   local function over(w)
     if not w then return false end
@@ -278,17 +375,6 @@ local function mouseOverSatellite()
   if over(detailwin.Window()) then return true end
   local shareW, importW = sharewin.Windows()
   return over(shareW) or over(importW)
-end
-
--- The preset row under the mouse, for drag-to-reorder. Rows sit inside
--- category bands, so a drop can resolve to both a zone and a row.
-local function rowAtMouse()
-  local my = contentMouseY()
-  if my == nil then return nil end
-  for _, r in ipairs(rowZones) do
-    if my >= r.y0 and my < r.y1 then return r end
-  end
-  return nil
 end
 
 -- Hold-and-MOVE to drag. Each slot has an INVISIBLE drag surface
@@ -319,7 +405,7 @@ local togglePos = nil -- mouse position at that toggle
 local function inToggleGrace()
   if (uikit.Now() - toggleGrace) >= TOGGLE_GRACE_TICKS then return false end
   if togglePos == nil then return true end
-  local m = Mouse.GetPosition()
+  local m = uikit.MousePos()
   if m == nil then return true end
   local dx, dy = m.x - togglePos.x, m.y - togglePos.y
   return dx * dx + dy * dy < TOGGLE_GRACE_R2
@@ -340,13 +426,12 @@ finishDrag = function(commit)
   drag = nil
   lastDragEnd = uikit.Now()
   if ghost then ghost.root.hidden = true end
+  if dropLine then pcall(function() dropLine.hidden = true end) end
   pcall(function() restoreSurf(d.slot) end)
   if commit then
     local ok, err = pcall(function()
-      -- Resolve BOTH: a drop can change a preset's category and its position
-      -- in one gesture. Header slots ignore the row.
-      local z = zoneAtMouse()
-      if z and d.slot.onDrop then d.slot.onDrop(z, rowAtMouse()) end
+      local t = resolveDrop(d.slot)
+      if t ~= nil then applyDrop(d.slot, t) end
     end)
     if not ok then log(formatStr("[PV] drop failed: {}", tostring(err))) end
   end
@@ -365,24 +450,36 @@ local function startDrag(slot)
   pcall(function() w = math.min(prettyui.SimpleButton.getSize(text), 220) end)
   g.root:SetSize(w, 26)
   g.root.hidden = false
-  -- expand the HELD surface over the window content (capture trick)
+  -- expand the HELD surface over the whole list (capture trick)
   slot.dragSurf:SetPos(0, 0)
-  slot.dragSurf:SetSize(USABLE + SCROLLBAR_W, math.max(win.contentHeight or 0, WIN_H))
+  slot.dragSurf:SetSize(USABLE + SCROLLBAR_W, math.max(list.contentHeight or 0, WIN_H))
   pcall(function() slot.dragSurf:MoveToFront() end)
+  -- the line draws above the capture; it is click-through
+  pcall(function() ensureDropLine():MoveToFront() end)
   pcall(function() g.root:MoveToFront() end) -- ghost above the capture
 end
 
 -- Per-tick while a drag is live; called from the pvWindowDrag ticker.
 dragTick = function()
   if not drag then return end
-  pcall(function()
-    local m = Mouse.GetPosition()
+  local ok, err = pcall(function()
+    local m = uikit.MousePos()
     if m and ghost then ghost.root:SetPos(m.x + 14, m.y - 13) end
+    edgeScroll(m)
+    local t = resolveDrop(drag.slot)
+    local line = ensureDropLine()
+    line.hidden = t == nil
+    if t ~= nil then
+      line:SetPos(0, math.max(0, t.lineY - 1))
+      line:SetSize(lastListW, 2)
+      line:MoveToFront()
+    end
   end)
+  if not ok then uikit.ReportOnce("drag tick", err) end
 end
 
--- Build + wire a slot's drag surface (parent = the window content). Reads
--- slot.dragText / slot.onDrop / slot.noDrag / slot.header at event time, so
+-- Build + wire a slot's drag surface (parent = the list content). Reads
+-- slot.dragText / slot.noDrag / slot.header / slot.preset at event time, so
 -- one wiring serves whatever the pooled slot currently displays.
 local function attachDrag(slot, parent)
   local surf = ui.Layer.new(parent)
@@ -390,16 +487,17 @@ local function attachDrag(slot, parent)
   surf.hidden = true
   slot.dragSurf = surf
   -- forward wheel events to the window scroll instead of swallowing them
-  pcall(function() surf:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", win._onScrollWheel) end)
+  pcall(function() surf:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", list._onScrollWheel) end)
 
-  surf:Subscribe(ui.Hook.ONHOLD, function()
+  surf:Subscribe(ui.Hook.ONHOLD, function(c, hx, hy)
     local ok, err = pcall(function()
       if drag then return end
+      uikit.CalibratePointer(c, hx, hy)
       -- within the post-toggle grace the layout just moved: don't arm
       if inToggleGrace() then return end
       -- a press inside an overlapping satellite window is not ours
       if mouseOverSatellite() then return end
-      local m = Mouse.GetPosition()
+      local m = uikit.MousePos()
       if not m then return end
       -- ONHOLD streams roughly every tick while held; a LONG gap means the
       -- previous press ended without ONRELEASE (cursor slid off the
@@ -438,7 +536,7 @@ local function attachDrag(slot, parent)
       -- a release inside an overlapping satellite window is not a click here
       if mouseOverSatellite() then return end
       toggleGrace = uikit.Now()
-      togglePos = Mouse.GetPosition()
+      togglePos = uikit.MousePos()
       local h = slot.header
       h:SetExpanded(not h.expanded)
       if h.onToggle then h.onToggle(h, h.expanded) end
@@ -499,7 +597,7 @@ end
 local function ensureRowSlot(i)
   local s = rowPool[i]
   if s then return s end
-  local body = win.content
+  local body = list.content
   s = {}
   rowPool[i] = s
 
@@ -571,7 +669,7 @@ local function ensureRowSlot(i)
     -- self-dismissing hint instead of letting Show() fail quietly.
     if not bankpage.IsBankOpen() then
       playSfx(BLOCKED_SFX)
-      uikit.ShowInstantTip(s.btn, "Bank not in view", nil,
+      uikit.ShowInstantTip(s.btn, "Bank not in view", body,
         uikit.TIP_BLOCKED_TICKS)
       return
     end
@@ -598,7 +696,7 @@ local function ensureRowSlot(i)
             uikit.ShowInstantTip(s.btn,
               why == "preset_open" and "Close the bank's preset panel first"
               or "Bank view unavailable (" .. tostring(why) .. ")",
-              nil, uikit.TIP_BLOCKED_TICKS)
+              body, uikit.TIP_BLOCKED_TICKS)
           end
         end
         relayout() -- refresh the active highlight
@@ -618,13 +716,13 @@ local function ensureRowSlot(i)
     if not ok then log(formatStr("[PV] bank toggle failed: {}", tostring(err))) end
   end)
   -- forward wheel events to the window scroll instead of swallowing them
-  pcall(function() s.btn:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", win._onScrollWheel) end)
+  pcall(function() s.btn:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", list._onScrollWheel) end)
   -- hover: normal delayed tooltip only while the bank is open; with it closed
   -- the hover shows nothing - the "Bank not in view" hint is click-only
   attachDelayedTooltip(s.btn, function()
     if not bankpage.IsBankOpen() then return nil end
     return "Toggle this preset's bank view"
-  end)
+  end, body)
   attachDrag(s, body) -- edit-mode drag surface, overlays the row
 
   -- Preview cell: toggles the preset's detail window.
@@ -652,8 +750,8 @@ local function ensureRowSlot(i)
   s.viewBtn:Subscribe(ui.Hook.ONCLICK, function()
     M.ToggleDetail(s.preset)
   end)
-  pcall(function() s.viewBtn:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", win._onScrollWheel) end)
-  attachDelayedTooltip(s.viewBtn, "Preview contents")
+  pcall(function() s.viewBtn:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", list._onScrollWheel) end)
+  attachDelayedTooltip(s.viewBtn, "Preview contents", body)
 
   s.delBtn = prettyui.SpriteButton.new(body, "TRASH", function()
     playSfx(CLICK_SFX)
@@ -667,9 +765,9 @@ local function ensureRowSlot(i)
       relayout()
     end)
     if not ok then log(formatStr("[PV] delete failed: {}", tostring(err))) end
-  end, { size = 20, _onScrollWheel = win._onScrollWheel })
+  end, { size = 20, _onScrollWheel = list._onScrollWheel })
   setButtonSprites(s.delBtn, 36552)
-  attachDelayedTooltip(s.delBtn.root, "Delete preset")
+  attachDelayedTooltip(s.delBtn.root, "Delete preset", body)
 
   return s
 end
@@ -798,7 +896,7 @@ local function makeSectionHeader(parent)
     if not ok then log(formatStr("[PV] header toggle failed: {}", tostring(err))) end
   end)
   -- forward wheel events to the window scroll instead of swallowing them
-  pcall(function() h.root:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", win._onScrollWheel) end)
+  pcall(function() h.root:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", list._onScrollWheel) end)
 
   h:SetIcon(nil)
   updateState()
@@ -808,7 +906,7 @@ end
 local function ensureHeaderSlot(i)
   local s = headerPool[i]
   if s then return s end
-  local body = win.content
+  local body = list.content
   s = {}
   headerPool[i] = s
 
@@ -832,9 +930,9 @@ local function ensureHeaderSlot(i)
       editingCat = s.cat
       pcall(relayout)
     end
-  end, { size = 20, _onScrollWheel = win._onScrollWheel })
+  end, { size = 20, _onScrollWheel = list._onScrollWheel })
   setButtonSprites(s.renameBtn, 20983, 20984)
-  attachDelayedTooltip(s.renameBtn.root, "Rename category")
+  attachDelayedTooltip(s.renameBtn.root, "Rename category", body)
 
   -- Opens the icon picker for this category; same sprite as the detail
   -- window's icon button.
@@ -846,9 +944,10 @@ local function ensureHeaderSlot(i)
       end
     end)
     if not ok then log(formatStr("[PV] icon picker failed: {}", tostring(err))) end
-  end, { size = 24, _onScrollWheel = win._onScrollWheel })
+  end, { size = 24, _onScrollWheel = list._onScrollWheel })
   setButtonSprites(s.iconBtn, 36153)
-  attachDelayedTooltip(s.iconBtn.root, "Choose an icon for this category")
+  attachDelayedTooltip(s.iconBtn.root, "Choose an icon for this category",
+    body)
 
   s.delBtn = prettyui.SpriteButton.new(body, "TRASH", function()
     playSfx(CLICK_SFX)
@@ -859,9 +958,9 @@ local function ensureHeaderSlot(i)
       relayout()
     end)
     if not ok then log(formatStr("[PV] delete category failed: {}", tostring(err))) end
-  end, { size = 20, _onScrollWheel = win._onScrollWheel })
+  end, { size = 20, _onScrollWheel = list._onScrollWheel })
   setButtonSprites(s.delBtn, 36552)
-  attachDelayedTooltip(s.delBtn.root, "Delete category (presets kept)")
+  attachDelayedTooltip(s.delBtn.root, "Delete category (presets kept)", body)
 
   return s
 end
@@ -881,7 +980,7 @@ end
 local function ensureSep(i)
   local sp = sepPool[i]
   if sp then return sp end
-  sp = ui.Rectangle.new(win.content)
+  sp = ui.Rectangle.new(list.content)
   sp.fill = true
   sp.rgba = CARD_SEP_RGBA
   sp.clickthrough = true
@@ -889,25 +988,25 @@ local function ensureSep(i)
   return sp
 end
 
--- The "(drag presets here)" hint of an empty category: a full row in the
+-- The drag hint of an empty category: a full row in the
 -- zebra flow - band, accent strip and the muted text.
 local function ensureHint(i)
   local hint = hintPool[i]
   if hint then return hint end
   hint = {}
-  hint.bg = ui.Rectangle.new(win.content)
+  hint.bg = ui.Rectangle.new(list.content)
   hint.bg.fill = true
   hint.bg.clickthrough = true
-  hint.accent = ui.Rectangle.new(win.content)
+  hint.accent = ui.Rectangle.new(list.content)
   hint.accent.fill = true
   hint.accent.rgba = ACCENT_RGBA
   hint.accent.clickthrough = true
-  hint.text = prettyui.Text.new(win.content, {
-    text = "(drag presets here)",
+  hint.text = prettyui.Text.new(list.content, {
+    text = "(edit mode then drag presets here)",
     x = 20, y = 0,
     height = 16,
     colour = 0x8A7B5C99,
-    _onScrollWheel = win._onScrollWheel,
+    _onScrollWheel = list._onScrollWheel,
   })
   hintPool[i] = hint
   return hint
@@ -921,7 +1020,7 @@ end
 
 local function ensureRenamePair()
   if renameField then return end
-  local body = win.content
+  local body = list.content
   local function commit()
     local ok, err = pcall(function()
       local old = editingCat
@@ -945,7 +1044,7 @@ local function ensureRenamePair()
     maxLength = 25,
     placeholder = "Category name",
     onSubmit = commit,
-    _onScrollWheel = win._onScrollWheel,
+    _onScrollWheel = list._onScrollWheel,
   })
   renameField.root.hidden = true
   renameOk = prettyui.SimpleButton.new(body, "OK", function()
@@ -953,7 +1052,7 @@ local function ensureRenamePair()
     commit()
   end, {
     x = USABLE - 56, y = 0, width = 56, height = 24,
-    _onScrollWheel = win._onScrollWheel,
+    _onScrollWheel = list._onScrollWheel,
   })
   renameOk.root.hidden = true
 end
@@ -997,7 +1096,7 @@ relayout = function()
     table.insert(order, 1, UNCAT)
   end
   -- While searching, drop sections with no matches: a bare header over
-  -- nothing is noise, and so is the edit-mode "(drag presets here)" hint.
+  -- nothing is noise, and so is the empty-category drag hint.
   if filtering then
     local kept = {}
     for _, cat in ipairs(order) do
@@ -1031,6 +1130,7 @@ relayout = function()
   if PersistentDB:GetBool("ui.lockAlpha") ~= true then
     orderIdx = store.PresetOrderIndex()
   end
+  dragOrderIdx = orderIdx or {}
   for _, g in pairs(groups) do
     table.sort(g, function(a, b)
       if orderIdx ~= nil then
@@ -1125,12 +1225,16 @@ relayout = function()
   if viewH == nil or viewH <= 1 then
     viewH = (win.root.height or WIN_H) - TITLE_H - BORDER
   end
-  local barVisible = (listTop + totalRows * ROW_H + 8) > viewH
+  -- The list fills the window below the top bar and scrolls on its own.
+  local listH = math.max(1, viewH - listTop)
+  list.root:SetPos(0, listTop)
+  list:SetSize(USABLE + SCROLLBAR_W, listH)
+  local barVisible = (totalRows * ROW_H + 8) > listH
   local listW = barVisible and USABLE or (USABLE + SCROLLBAR_W)
 
   dropZones = {}
-  rowZones = {}
-  local y = listTop
+  lastListW = listW
+  local y = 0
   local hIdx, rIdx, tIdx, sIdx = 0, 0, 0, 0
   -- ONE continuous zebra from top to bottom - headers count in the
   -- alternation like any other row, and nothing leaves gaps. The list
@@ -1142,6 +1246,7 @@ relayout = function()
     local isUncat = (cat == UNCAT)
     local isFlat = (cat == FLAT)
     local zoneStart = y
+    local zoneRows = {}
     -- Searching force-expands: a match hidden inside a collapsed section
     -- would look like no result at all. The session collapse state is read
     -- past, not written, so sections snap back when the search clears.
@@ -1178,13 +1283,6 @@ relayout = function()
         local s = ensureHeaderSlot(hIdx)
         s.cat = cat
         s.dragText = cat
-        s.onDrop = function(z)
-          if z.cat ~= s.cat then
-            store.ReorderCategory(s.cat, z.cat) -- "" target = first position
-            playSfx(DROP_SFX)
-            relayout()
-          end
-        end
         s.noDrag = isUncat -- Uncategorised is pinned first, never reorderable
         band = band + 1
         s.header.base = (band % 2 == 1) and ROW_ODD or ROW_EVEN
@@ -1220,29 +1318,6 @@ relayout = function()
         local s = ensureRowSlot(rIdx)
         s.preset = p
         s.dragText = p.name
-        s.onDrop = function(z, row)
-          if not s.preset then return end
-          -- A drop can do two things at once: move the preset to another
-          -- category AND place it at a position. Both are no-ops when nothing
-          -- actually changes, so a drop back where it started stays silent
-          -- and skips the pointless store write + relayout.
-          local changed = false
-          if not z.flat and (s.preset.category or "") ~= z.cat then
-            store.SetCategory(s.preset.id, z.cat) -- "" clears the category
-            changed = true
-          end
-          -- Reordering is the only part the alphabetical lock disables;
-          -- dragging between categories stays available either way.
-          if PersistentDB:GetBool("ui.lockAlpha") ~= true
-            and row ~= nil and row.id ~= s.preset.id then
-            store.ReorderPreset(s.preset.id, row.id)
-            changed = true
-          end
-          if changed then
-            playSfx(DROP_SFX)
-            relayout()
-          end
-        end
         band = band + 1
         s.base = (band % 2 == 1) and ROW_ODD or ROW_EVEN
         s.bg.hidden = false
@@ -1313,9 +1388,7 @@ relayout = function()
         -- edit mode: the bin sits just left of the hairline
         s.delBtn.root.hidden = not editMode
         if editMode then s.delBtn.root:SetPos(cellX - 24, y + 5) end
-        -- Reorder target: the band this row occupies, in the same scrolled
-        -- content coords as dropZones.
-        rowZones[#rowZones + 1] = { id = p.id, y0 = y, y1 = y + ROW_H }
+        zoneRows[#zoneRows + 1] = { id = p.id, y0 = y, y1 = y + ROW_H }
         y = y + ROW_H
       end
       -- Empty categories always show the hint; flat mode never does.
@@ -1342,6 +1415,7 @@ relayout = function()
     -- setting back on would find the buckets quietly emptied.
     dropZones[#dropZones + 1] = {
       cat = isUncat and "" or cat, y0 = zoneStart, y1 = y, flat = isFlat,
+      headed = not freeStanding, rows = zoneRows,
     }
     prevExpandedCard = not freeStanding and not collapsed
   end
@@ -1365,7 +1439,7 @@ relayout = function()
     emptyNotice[i].hidden = eLines[i] == nil
   end
 
-  pcall(function() win:SetContentHeight(y + 8) end)
+  pcall(function() list:SetContentHeight(y + 8) end)
   layoutGuard = false
   -- The BankUtil sidebar column mirrors this list. One hook at the end of
   -- every relayout covers every mutation that redraws the window (saves,
@@ -1396,11 +1470,16 @@ M.Destroy = function()
     ghost = nil
   end
   uikit.DestroyTips()
+  if list then
+    pcall(function() list:Destroy() end)
+    list = nil
+  end
   if win then
     pcall(function() win:Destroy() end)
     win = nil
   end
   rowPool, headerPool, hintPool, sepPool = {}, {}, {}, {}
+  dropLine = nil
   renameField, renameOk, commitRename = nil, nil, nil
   layoutGuard = false
 end
@@ -1419,6 +1498,7 @@ local function buildWindow(parent, x, y)
       x = x, y = y,
       width = WIN_W, height = WIN_H,
       minWidth = WIN_W, minHeight = 220,
+      scrollable = false,
       onClose = function()
         -- Mid-rename close (X or bank closing): keep whatever was typed.
         if editingCat and commitRename then pcall(commitRename) end
@@ -1438,6 +1518,13 @@ local function buildWindow(parent, x, y)
     centreTitle(win)
     -- Tooltips with no explicit parent land in this window's content.
     uikit.SetDefaultTipParent(win.content)
+    -- The preset list scrolls inside its own view; the top bar stays fixed.
+    list = prettyui.SimpleView.new(win.content, {
+      x = 0, y = LIST_Y,
+      width = USABLE + SCROLLBAR_W,
+      height = WIN_H - TITLE_H - BORDER - LIST_Y,
+      scrollable = true, scrollStep = ROW_H,
+    })
     -- Hand each satellite module what it needs of ours (one-directional:
     -- none of them require pvwin back, or the cycle would hand one side a
     -- half-initialised module).
@@ -1520,7 +1607,7 @@ local function buildWindow(parent, x, y)
         pcall(function() searchClear.SetVisible(searchQuery ~= "") end)
         pcall(relayout)
       end,
-      _onScrollWheel = win._onScrollWheel,
+      _onScrollWheel = list._onScrollWheel,
     })
     searchField.root.hidden = true
     -- Clear icon inside the field's right edge; wipes the query in place.

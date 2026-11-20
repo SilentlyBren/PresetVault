@@ -106,12 +106,15 @@ M.OnIdentityChanged = scheduleRender
 
 -- Defined under "actions" below; the menu callbacks above them need the
 -- names (a later `local function` is invisible to an earlier closure).
-local toggleView, toggleCollapse
+local toggleView, toggleCollapse, deferClick
 
 local render -- forward declaration
 
+local dragging -- forward declaration: true while a row drag is live
 uikit.AddTicker("pvColumnRender", function()
   if not renderPending then return end
+  -- a render would hand the held button back its row geometry mid-drag
+  if dragging() then return end
   renderPending = false
   if col ~= nil then pcall(render) end
 end)
@@ -145,6 +148,7 @@ end
 -- Preset rename = the same inline field the categories use, over the row.
 local function onRenameEntry(presetId)
   if col == nil or presetId == nil then return end
+  uikit.PlaySfx(uikit.CLICK_SFX)
   col.editingPreset = presetId
   col.editingCat = nil
   col.renameFor = nil
@@ -152,6 +156,7 @@ local function onRenameEntry(presetId)
 end
 
 local function onIconEntry(presetId)
+  uikit.PlaySfx(uikit.CLICK_SFX)
   pcall(function()
     local p = presetById(presetId)
     if p ~= nil then window.OpenIconPicker(p) end
@@ -159,6 +164,7 @@ local function onIconEntry(presetId)
 end
 
 local function onShareEntry(presetId)
+  uikit.PlaySfx(uikit.CLICK_SFX)
   pcall(function()
     local p = presetById(presetId)
     if p ~= nil then window.OpenShare(p) end
@@ -212,6 +218,7 @@ end
 -- shows it; commitRename below stores it). Set by the menu entry.
 local function onEditCategory(cat)
   if col == nil or cat == nil then return end
+  uikit.PlaySfx(uikit.CLICK_SFX)
   col.editingCat = cat
   col.editingPreset = nil
   col.renameFor = nil
@@ -221,6 +228,7 @@ end
 -- "Set Icon" on a heading: the window-owned picker, same flow as a preset's.
 local function onIconCategory(cat)
   if cat == nil then return end
+  uikit.PlaySfx(uikit.CLICK_SFX)
   pcall(function() window.OpenCategoryIconPicker(cat) end)
 end
 
@@ -302,14 +310,11 @@ end
 -- The menu IS the action pipeline: the rows carry NO button handlers of
 -- their own, so a click cannot double-fire.
 local function onViewEntry(presetId)
-  pcall(function()
-    local p = presetById(presetId)
-    if p ~= nil then toggleView(p) end
-  end)
+  pcall(deferClick, "p", presetId)
 end
 
 local function onToggleCatEntry(cat)
-  pcall(function() toggleCollapse(cat) end)
+  pcall(deferClick, "c", cat)
 end
 
 Event.MiniMenuReady.Subscribe("pvColumnMenu", function(event)
@@ -362,8 +367,7 @@ Event.MiniMenuReady.Subscribe("pvColumnMenu", function(event)
       -- Cancel, name on the top entry only.
       if cat ~= window.UNCAT then
         -- Category reordering, menu-driven: pick the category to slot this
-        -- one above or below. The column has no drag, so this is its whole
-        -- reorder story.
+        -- one above or below. The menu alternative to dragging the heading.
         local others = {}
         for _, c in ipairs(store.Categories()) do
           if c.name ~= window.UNCAT and c.name ~= cat then
@@ -505,6 +509,322 @@ toggleCollapse = function(cat)
   window.Relayout() -- shared keys: the window's section follows along
 end
 
+-- ---- drag to reorder ----------------------------------------------------------
+-- Hold a row or heading and move to drag it; drop on the gold line.
+-- deferClick parks the row's click until release, and drops it if a drag
+-- started.
+local DRAG_DEADZONE = 6 -- px of travel while held before a drag starts
+local HOLD_GAP_TICKS = 4
+local DRAG_DEAD_TICKS = 10
+local CLICK_SETTLE_TICKS = 3
+local EDGE_PX, EDGE_TICKS = 16, 6
+local GHOST_FILL = 0x403728E0
+
+-- { part, kind "p"|"c", key, label, preset, x, y, tick, dragging }
+local press = nil
+local pendingClick = nil -- { kind, key, tick }: a menu click not yet run
+local lastDragEnd = -100
+local lastEdgeScroll = -100
+
+dragging = function()
+  return press ~= nil and press.dragging == true
+end
+
+local function runClick(click)
+  if click.kind == "p" then
+    local p = presetById(click.key)
+    if p ~= nil then toggleView(p) end
+  else
+    toggleCollapse(click.key)
+  end
+end
+
+deferClick = function(kind, key)
+  if dragging() then return end
+  if (uikit.Now() - lastDragEnd) < 3 then return end
+  pendingClick = { kind = kind, key = key, tick = uikit.Now() }
+end
+
+-- The pointer's y in list content coords, its y within the visible list,
+-- and the list's height; nil when the pointer is outside the visible list.
+local function listPointer()
+  if col == nil then return nil end
+  local m = uikit.MousePos()
+  local origin = nil
+  pcall(function() origin = col.view.root.xyGlobal end)
+  if m == nil or origin == nil then return nil end
+  local vw, vh = viewBounds(col.ctx)
+  local lx, ly = m.x - origin.x, m.y - origin.y
+  if lx < 0 or lx >= vw or ly < 0 or ly >= vh then return nil end
+  return ly + (col.view.scrollY or 0), ly, vh
+end
+
+-- Where the held row or heading would land right now, or nil when the drop
+-- would change nothing. A heading: { first, cat, below, lineY }. A preset:
+-- { setCat, target, lineY }.
+local function resolveDrop(pr)
+  local y = listPointer()
+  if y == nil then return nil end
+  local zones = col.zones or {}
+  local zi, z
+  for i, zone in ipairs(zones) do
+    if y >= zone.y0 and y < zone.y1 then
+      zi, z = i, zone
+      break
+    end
+  end
+  if z == nil then return nil end
+  local pinned = z.cat == nil or z.cat == window.UNCAT
+  if pr.kind == "c" then
+    if z.flat or z.cat == pr.key then return nil end
+    local oi
+    for i, zone in ipairs(zones) do
+      if zone.cat == pr.key then oi = i end
+    end
+    -- Uncategorised is pinned first, so a drop on it means "first after it".
+    local below = pinned or y >= (z.y0 + z.y1) / 2
+    if oi ~= nil and ((below and zi == oi - 1)
+      or (not below and zi == oi + 1)) then
+      return nil
+    end
+    return { first = pinned, cat = z.cat, below = below,
+      lineY = below and z.y1 or z.y0 }
+  end
+  local p = pr.preset
+  local zoneCat = pinned and "" or z.cat
+  local catChange = not z.flat and (p.category or "") ~= zoneCat
+  local underHeader = z.headed and (z.y0 + ROW_H) or z.y0
+  local gap = nil
+  if PersistentDB:GetBool("ui.lockAlpha") ~= true then
+    gap = uikit.GapAt(z.rows, y)
+  end
+  if gap == nil then
+    if not catChange then return nil end
+    return { setCat = zoneCat, lineY = underHeader }
+  end
+  local aboveId = gap.above and gap.above.id or nil
+  local belowId = gap.below and gap.below.id or nil
+  if aboveId == p.id or belowId == p.id then return nil end
+  local target = uikit.GapTarget(col.orderIdx or {}, p.id, aboveId, belowId)
+  if target == nil and not catChange then return nil end
+  return { setCat = catChange and zoneCat or nil, target = target,
+    lineY = gap.lineY }
+end
+
+local function applyDrop(pr, t)
+  local ok, err = pcall(function()
+    if pr.kind == "c" then
+      if t.first then
+        store.ReorderCategory(pr.key, "") -- "" target = first position
+      else
+        store.MoveCategory(pr.key, t.cat, t.below)
+      end
+    else
+      if t.setCat ~= nil then store.SetCategory(pr.key, t.setCat) end
+      if t.target ~= nil then store.ReorderPreset(pr.key, t.target) end
+    end
+    window.Relayout() -- shared data: the standalone window follows along
+  end)
+  if not ok then
+    log(formatStr("[PV Bankcore] column drop failed: {}", tostring(err)))
+  end
+  uikit.PlaySfx(uikit.DROP_SFX)
+end
+
+-- The ghost row and the insertion line, built on first use per mount.
+local function ensureDragParts()
+  if col.ghost ~= nil then return end
+  local body = col.view.content
+  local g = ui.Layer.new(body)
+  g.clickthrough = true
+  g.hidden = true
+  col.ghostFill = ui.Rectangle.new(g)
+  col.ghostFill.fill = true
+  col.ghostFill.rgba = GHOST_FILL
+  col.ghostFill.clickthrough = true
+  col.ghostBorder = ui.Rectangle.new(g)
+  col.ghostBorder.fill = false
+  pcall(function() col.ghostBorder.outlineThickness = 1 end)
+  col.ghostBorder.rgba = SELECTED_BORDER
+  col.ghostBorder.clickthrough = true
+  col.ghostLabel = ui.Text.new(g)
+  col.ghostLabel.font = ROW_FONT
+  col.ghostLabel.rgba = ROW_TEXT_RGBA
+  pcall(function() col.ghostLabel.alignVertical = ui.AlignMode.CENTRE end)
+  col.ghostLabel.maxLines = 1
+  col.ghostLabel.clickthrough = true
+  col.ghost = g
+  col.dropLine = ui.Rectangle.new(body)
+  col.dropLine:SetSize(math.max(1, col.inner or 1), 2)
+  col.dropLine.fill = true
+  col.dropLine.rgba = SELECTED_BORDER
+  col.dropLine.clickthrough = true
+  col.dropLine.hidden = true
+end
+
+local function startDrag()
+  press.dragging = true
+  pendingClick = nil
+  pcall(uikit.HideTip)
+  ensureDragParts()
+  local inner = col.inner or 0
+  local _, vh = viewBounds(col.ctx)
+  col.ghost:SetSize(inner, ROW_H)
+  col.ghostFill:SetSize(inner, ROW_H)
+  col.ghostBorder:SetSize(inner, ROW_H)
+  col.ghostLabel:SetPos(10, 0)
+  col.ghostLabel:SetSize(math.max(1, inner - 16), ROW_H)
+  col.ghostLabel.content = press.label or ""
+  -- the HELD button covers the whole list, so it keeps the hold stream
+  local btn = press.part.btn
+  btn:SetPos(0, 0)
+  btn:SetSize(inner, math.max(col.contentH or 0, vh))
+  pcall(function() btn:MoveToFront() end)
+  pcall(function() col.dropLine:MoveToFront() end)
+  pcall(function() col.ghost:MoveToFront() end)
+  -- the held row reads as lifted: its own name and icon go, the ghost stays
+  pcall(function()
+    local part = press.part
+    part.text.hidden = true
+    part.icon.hidden = true
+    if part.arrow ~= nil then part.arrow.hidden = true end
+  end)
+end
+
+local function finishDrag(commit)
+  local pr = press
+  press = nil
+  lastDragEnd = uikit.Now()
+  if col == nil or pr == nil then return end
+  local t = commit and resolveDrop(pr) or nil
+  pcall(function()
+    col.ghost.hidden = true
+    col.dropLine.hidden = true
+  end)
+  if t ~= nil then applyDrop(pr, t) end
+  scheduleRender() -- also hands the held button back its row geometry
+end
+
+-- Per tick while a drag is live: edge scrolling, the ghost, the line.
+local function dragStep()
+  local y, ly, vh = listPointer()
+  if y == nil then
+    col.dropLine.hidden = true
+    return
+  end
+  local now = uikit.Now()
+  if (now - lastEdgeScroll) >= EDGE_TICKS then
+    local dir = (ly < EDGE_PX) and -1 or ((ly >= vh - EDGE_PX) and 1 or 0)
+    if dir ~= 0 then
+      lastEdgeScroll = now
+      col.view:ScrollBy(dir * ROW_H)
+      y = ly + (col.view.scrollY or 0)
+    end
+  end
+  local top = col.view.scrollY or 0
+  col.ghost.hidden = false
+  col.ghost:SetPos(0, math.max(top,
+    math.min(top + vh - ROW_H, math.floor(y - ROW_H / 2))))
+  col.ghost:MoveToFront()
+  local t = resolveDrop(press)
+  col.dropLine.hidden = t == nil
+  if t ~= nil then
+    col.dropLine:SetPos(0, math.max(0, t.lineY - 1))
+    col.dropLine:SetSize(col.inner or 0, 2)
+    col.dropLine:MoveToFront()
+  end
+end
+
+local function canDrag(pr)
+  if col == nil or searchQuery ~= "" then return false end
+  if col.editingCat ~= nil or col.editingPreset ~= nil then return false end
+  return not (pr.kind == "c" and pr.key == window.UNCAT)
+end
+
+local function onHold(part, kind)
+  local now = uikit.Now()
+  if dragging() then
+    press.tick = now
+    return
+  end
+  local m = uikit.MousePos()
+  if m == nil then return end
+  if press == nil or press.part ~= part
+    or (now - press.tick) > HOLD_GAP_TICKS then
+    local key, label
+    if kind == "p" then
+      if part.preset == nil then return end
+      key, label = part.preset.id, part.preset.name
+    else
+      if part.cat == nil then return end
+      key, label = part.cat, part.cat
+    end
+    press = { part = part, kind = kind, key = key, label = label,
+      preset = part.preset, x = m.x, y = m.y, tick = now }
+    return
+  end
+  press.tick = now
+  if not canDrag(press) then return end
+  local dx, dy = m.x - press.x, m.y - press.y
+  if dx * dx + dy * dy >= DRAG_DEADZONE * DRAG_DEADZONE then startDrag() end
+end
+
+local function onRelease(part)
+  if press == nil or press.part ~= part then return end
+  if press.dragging then
+    finishDrag(true)
+    return
+  end
+  press = nil
+  if pendingClick ~= nil then
+    local click = pendingClick
+    pendingClick = nil
+    runClick(click)
+  end
+end
+
+-- Wires a row's or heading's button into the drag machinery.
+local function bindDrag(part, kind)
+  part.btn:Subscribe(ui.Hook.ONHOLD, function(c, hx, hy)
+    if not dragging() then pcall(uikit.CalibratePointer, c, hx, hy) end
+    local ok, err = pcall(onHold, part, kind)
+    if not ok then uikit.ReportOnce("column hold", err) end
+    return true
+  end)
+  local function release()
+    pcall(onRelease, part)
+    return true
+  end
+  part.btn:Subscribe(ui.Hook.ONRELEASE, release)
+  pcall(function() part.btn:Subscribe(ui.Hook.ONDRAGCOMPLETE, release) end)
+end
+
+uikit.AddTicker("pvColumnDrag", function()
+  if col == nil then
+    press, pendingClick = nil, nil
+    return
+  end
+  local now = uikit.Now()
+  if press ~= nil then
+    if press.dragging then
+      if (now - press.tick) > DRAG_DEAD_TICKS then
+        finishDrag(false)
+      else
+        local ok, err = pcall(dragStep)
+        if not ok then uikit.ReportOnce("column drag", err) end
+      end
+    elseif (now - press.tick) > HOLD_GAP_TICKS then
+      press = nil
+    end
+  end
+  if pendingClick ~= nil and press == nil
+    and (now - pendingClick.tick) >= CLICK_SETTLE_TICKS then
+    local click = pendingClick
+    pendingClick = nil
+    pcall(runClick, click)
+  end
+end)
+
 -- ---- pooled parts (per mount - Core destroys them with the column) ----------
 -- A heading row: band or soft-gold fill, gold text, chevron, accent strip.
 local function applyHeaderLook(h)
@@ -553,7 +873,7 @@ local function ensureHeader(i)
     h.btn = ui.Button.new(body)
     h.btn.alpha = 0
     h.btn.text.content = ""
-    -- no press handler: the left click executes the menu's top entry
+    -- no click handler: the left click executes the menu's top entry
     -- (Open/Close Category) - a handler here would double-fire
     h.btn:Subscribe(ui.Hook.ONMOUSEOVER, function()
       h.hovered = true
@@ -567,6 +887,7 @@ local function ensureHeader(i)
       applyHeaderLook(h)
       return true
     end)
+    bindDrag(h, "c")
   end)
   if not okB then col.headers[i] = nil return nil end
   return h
@@ -635,7 +956,7 @@ local function ensureRow(i)
     r.btn = ui.Button.new(body)
     r.btn.alpha = 0
     r.btn.text.content = ""
-    -- no press handler: the left click executes the menu's top entry
+    -- no click handler: the left click executes the menu's top entry
     -- (Load/Hide Preset) - a handler here would double-fire
     r.btn:Subscribe(ui.Hook.ONMOUSEOVER, function()
       r.hovered = true
@@ -649,6 +970,7 @@ local function ensureRow(i)
       applyRowLook(r)
       return true
     end)
+    bindDrag(r, "p")
   end)
   if not okB then col.rows[i] = nil return nil end
   return r
@@ -734,6 +1056,14 @@ render = function()
   local hIdx, rIdx, sIdx = 0, 0, 0
   local y = LIST_TOP
   local empty = true
+  -- Drop geometry for drag-to-reorder: one zone per group, top to bottom.
+  local flat = PersistentDB:GetBool("ui.noCategories") == true
+  col.zones = {}
+  col.inner = inner
+  col.orderIdx = nil
+  if PersistentDB:GetBool("ui.lockAlpha") ~= true then
+    col.orderIdx = store.PresetOrderIndex()
+  end
   -- default-hidden each pass; the matching header's branch shows it
   pcall(function()
     col.rename.root.hidden = true
@@ -749,6 +1079,7 @@ render = function()
     local prevExpandedCard = false
     for _, group in ipairs(groups) do
       local collapsed = false
+      local zoneStart, zoneRows = y, {}
       if group.header ~= nil then
         -- the previous card ended here: mark the boundary
         if prevExpandedCard then
@@ -888,11 +1219,15 @@ render = function()
                 col.renameOk.root:MoveToFront()
               end
             end)
+            zoneRows[#zoneRows + 1] = { id = p.id, y0 = y, y1 = y + ROW_H }
             y = y + ROW_H
             empty = false
           end
         end
       end
+      col.zones[#col.zones + 1] = { cat = group.header,
+        headed = group.header ~= nil, flat = flat,
+        y0 = zoneStart, y1 = y, rows = zoneRows }
       prevExpandedCard = group.header ~= nil and not collapsed
     end
   end
@@ -920,6 +1255,7 @@ render = function()
       col.emptyHint[i]:SetSize(inner, 16)
     end
   end)
+  col.contentH = y
   pcall(function() col.view:SetContentHeight(y) end)
 end
 
@@ -1048,6 +1384,7 @@ local function mount(ctx)
   -- UI, since a code has to be pasted somewhere. Icon 29456, the same art
   -- as the standalone window's import button.
   col.impBtn = prettyui.SimpleButton.new(ctx.parent, 29456, function()
+    uikit.PlaySfx(uikit.CLICK_SFX)
     pcall(window.OpenImport)
   end, { size = SIDE_BTN_W, iconSize = 16, categoryID = "auto" })
   uikit.AttachDelayedTooltip(col.impBtn.root,
@@ -1153,6 +1490,7 @@ local function unmount()
   col = nil
   hoveredRow = nil
   hoveredHeader = nil
+  press, pendingClick = nil, nil
 end
 
 -- Handed to core/bankutil (main.lua wires it before Connect): core/ cannot
