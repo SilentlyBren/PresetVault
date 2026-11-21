@@ -4,14 +4,13 @@ local M = {}
 
 local INV_BACKPACK = 93
 local INV_EQUIPMENT = 94
-local INV_BOB = 530 -- LORE_BOB: BoB familiar storage (fixed 32-slot container)
+local INV_BOB = 530 -- always reads 32 slots, whatever the familiar
 local INV_BANK = 95
-local BOB_MAX = 32 -- engine max BoB capacity (pack mammoth)
-local BOB_SLOTS_COMPONENT = 517 * 65536 + 34 -- BANK__BOB_SLOTS (bank interface)
+local BOB_MAX = 32
+local BOB_SLOTS_COMPONENT = 517 * 65536 + 34
 
--- The familiar's burden capacity, straight from the game's own config: the
--- pouch names its familiar, and the familiar carries its storage space.
--- Returns nil if any link in that chain is unavailable.
+-- Returns nil if any link in the pouch -> familiar -> capacity chain is
+-- unavailable.
 local function capacityFromConfig(pouchObjId)
   local cap = nil
   pcall(function()
@@ -28,7 +27,7 @@ local function capacityFromConfig(pouchObjId)
 end
 
 -- Filled slots as { slot, obj, count, name }; nil if the inventory is not
--- readable. Names are captured here so display never needs a config lookup.
+-- readable.
 local function captureInv(invId)
   local inv = Inventory.Find(invId)
   local slots = inv and inv:GetSlots()
@@ -51,18 +50,17 @@ local function followerObjId()
     if type(v) == "number" then
       objId = v
     else
-      objId = v.id -- the var carries an Obj config
+      objId = v.id
     end
   end)
+  -- the var reads -1, not nil, with no familiar out
   if objId == nil or objId < 0 then return nil end
   return objId
 end
 
--- The familiar's burden capacity, in descending order of trust: the game's
--- own config, the native BoB panel's child count, the highest filled slot,
--- then BOB_MAX.
 local function bobCapacity(items)
   local objId = followerObjId()
+  -- the panel's child count is stale once the familiar is dismissed
   if objId ~= nil then
     local fromConfig = capacityFromConfig(objId)
     if fromConfig ~= nil then return fromConfig end
@@ -86,9 +84,8 @@ local function bobCapacity(items)
   return BOB_MAX
 end
 
--- Captures all three containers into preset data. nil if equipment or
--- backpack is unreadable; the BoB section is present only when the familiar
--- is actually carrying something.
+-- Returns nil if equipment or backpack is unreadable. `bob` is present only
+-- when the familiar is carrying something.
 M.Capture = function()
   local equipment = captureInv(INV_EQUIPMENT)
   local backpack = captureInv(INV_BACKPACK)

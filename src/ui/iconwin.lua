@@ -1,10 +1,6 @@
--- The icon picker window: one persistent window, two modes - the skill-icon
--- grid, and a "custom" page where any sprite id can be typed with a live
--- preview. The Custom/Back buttons swap the window's content in place.
---
--- pvwin.lua requires this module and injects what it owns through
--- M.Configure: host layer and relayout. Callers supply their own anchor
--- coordinates, so this module knows nothing about the windows it serves.
+-- The icon picker window: a skill-icon grid and a custom sprite-id page.
+-- ui/pvwin configures it through M.Configure; this module must never
+-- require ui/pvwin back.
 local M = {}
 
 local store = require("core/store")
@@ -14,22 +10,18 @@ local bankutil = require("core/bankutil")
 local playSfx = uikit.PlaySfx
 local centreTitle, syncWindowChrome = uikit.CentreTitle, uikit.SyncWindowChrome
 
-local ICON_SWAP_SFX = 60742 -- plays when an icon is picked (incl. "No icon")
--- The page-swap buttons share the notch the buttons that OPEN this window
--- play, so stepping in and out of the custom page sounds like the same
--- family of action.
+local ICON_SWAP_SFX = 60742
 local CLICK_SFX = uikit.CLICK_SFX
 
-local BORDER, TITLE_H = 8, 32 -- PrettyUI Window chrome metrics
+local BORDER, TITLE_H = 8, 32
 
--- Injected by pvwin.lua (see header): { host, relayout() }.
+-- { host, relayout() }
 local ctx = nil
 M.Configure = function(c)
   ctx = c
 end
 
--- Skill icons assignable to presets: the coloured 25px set the Skills panel
--- itself uses.
+-- Most of these sprite ids are unnamed, so none can be looked up by enum.
 local SKILLS = {
   { "Attack", 197 }, { "Strength", 198 }, { "Defence", 199 },
   { "Constitution", 203 }, { "Ranged", 200 }, { "Magic", 202 },
@@ -43,13 +35,13 @@ local SKILLS = {
   { "Invention", 26541 }, { "Archaeology", 10782 },
 }
 
-local picker -- { win } the picker window, built once
-local pickerApply = nil -- the commit callback (receives icon id or nil)
+local picker
+local pickerApply = nil
 
 local function ensurePicker()
   if picker then return end
-  local COLS_P, CELL_P = 6, 36 -- cell pitch drives the window size too
-  local PX, PY = 8, 6 -- inner content padding
+  local COLS_P, CELL_P = 6, 36
+  local PX, PY = 8, 6
   local rows = math.ceil((#SKILLS + 1) / COLS_P) -- +1: the no-icon cell
   local pw = COLS_P * CELL_P + BORDER * 2 + 16
   local ph = TITLE_H + PY + 10 + rows * CELL_P + 34 + BORDER
@@ -65,20 +57,17 @@ local function ensurePicker()
   centreTitle(picker.win)
   local body = picker.win.content
 
-  -- One shared hover highlight, layered ON TOP of the icons - an underlay
-  -- is lost behind the denser skill art - and oversized by HL_PAD on each
-  -- side so it reads as a glow around the cell.
   local HL_PAD = 3
   local highlight = ui.Sprite.new(body)
   highlight:SetSize(CELL_P - 4 + HL_PAD * 2, CELL_P - 4 + HL_PAD * 2)
   highlight.spriteID = 18828
   highlight.clickthrough = true
   highlight.hidden = true
-  local hlOwner = nil -- which cell owns the highlight (leave events can
-  -- arrive AFTER the next cell's hover when crossing adjacent cells)
+  -- A cell's leave event can arrive after the next cell's hover.
+  local hlOwner = nil
 
-  -- Clears the hover highlight by hand, and is exposed so M.Open can do the
-  -- same defensively.
+  -- Picking closes the window under the pointer, so ONMOUSELEAVE never fires
+  -- for the picked cell; the highlight has to be cleared by hand.
   picker.ClearHighlight = function()
     hlOwner = nil
     highlight.hidden = true
@@ -95,11 +84,9 @@ local function ensurePicker()
     if not ok then log(formatStr("[PV] icon pick failed: {}", tostring(err))) end
   end
 
-  -- Everything belongs to one of the two pages; SetMode swaps them.
   local gridParts, customParts = {}, {}
 
-  -- Every skill icon, then one final cell (sprite 9134) that CLEARS the
-  -- preset's icon - "no icon" is a grid choice like any other.
+  -- The final cell (icon = nil) clears the icon.
   local cells = {}
   for i, skill in ipairs(SKILLS) do
     cells[i] = { sprite = skill[2], icon = skill[2] }
@@ -113,12 +100,11 @@ local function ensurePicker()
     local cy = PY + 4 + row * CELL_P + 2
     local spr = ui.Sprite.new(body)
     spr:SetPos(cx + 1, cy + 1)
-    spr:SetSize(28, 28) -- slightly over the 25px native art, matches the list icons
+    spr:SetSize(28, 28)
     spr.spriteID = cell.sprite
     spr:Subscribe(ui.Hook.ONCLICK, function() pick(cell.icon) end)
     spr:Subscribe(ui.Hook.ONMOUSEOVER, function()
       hlOwner = i
-      -- the glow art sits 1px low/right of the icon it frames - nudged back
       highlight:SetPos(cx - HL_PAD - 1, cy - HL_PAD - 1)
       highlight.hidden = false
       pcall(function() highlight:MoveToFront() end)
@@ -135,8 +121,8 @@ local function ensurePicker()
   local rowY = PY + 8 + rows * CELL_P
   local bodyW = pw - BORDER * 2
 
-  -- ---- custom page: label, id box, centred preview, Back / Set Icon ----
-  -- The typed sprite id, or nil when it is not one that may be drawn.
+  -- The typed sprite id, or nil when it is not safe to draw. Everything that
+  -- reaches a sprite goes through store.CleanIcon: some ids crash the client.
   local customField, customPreview
   local function typedId()
     local n = nil
@@ -148,8 +134,7 @@ local function ensurePicker()
   customLabel:SetPos(PX, PY + 2)
   customLabel:SetSize(bodyW - PX * 2, 16)
   customLabel.font = id.Font.MUSEO_SANS_15PT_REGULAR
-  customLabel.rgba = 0xE7D7B0FF -- PrettyUI's default text colour, matching
-  -- the share/import windows' help lines (prettyui text.lua)
+  customLabel.rgba = 0xE7D7B0FF
   customLabel.content = "Type a sprite ID"
   customLabel.clickthrough = true
   customParts[#customParts + 1] = customLabel
@@ -157,9 +142,7 @@ local function ensurePicker()
   customField = prettyui.TextField.new(body, {
     x = PX, y = PY + 24,
     width = bodyW - PX * 2,
-    maxLength = 10, -- the largest sprite id (int32 max) is 10 digits
-    -- Live preview: the sprite swaps in as the id is typed, and hides
-    -- again the moment the box holds anything unusable.
+    maxLength = 10, -- int32 max is 10 digits
     onChange = function()
       pcall(function()
         local id = typedId()
@@ -174,9 +157,6 @@ local function ensurePicker()
   })
   customParts[#customParts + 1] = customField.root
 
-  -- Preview slot: a 28px icon box on a slot sprite (backdrop and border in
-  -- one), centred horizontally and centred vertically between the id box
-  -- and the bottom button row.
   local fieldBottom = PY + 24 + 30
   local bx = math.floor((bodyW - 38) / 2)
   local by = fieldBottom + math.floor((rowY - fieldBottom - 38) / 2)
@@ -192,21 +172,17 @@ local function ensurePicker()
   customPreview.clickthrough = true
   customPreview.hidden = true
 
-  -- ---- mode switch ----
-  -- true = the custom page; false = the grid. The custom page always
-  -- arrives blank - a stale id would read as a suggestion.
+  -- true = the custom page, false = the grid
   picker.SetMode = function(customMode)
     picker.ClearHighlight()
     for _, c in ipairs(gridParts) do c.hidden = customMode end
     for _, c in ipairs(customParts) do c.hidden = not customMode end
     customPreview.hidden = true
     pcall(function() customField:SetText("") end)
-    -- the grid page is titled for whatever the picker is picking for
     pcall(function() picker.win:SetTitle(customMode and "Custom sprite"
       or picker.gridTitle or "Preset icon") end)
   end
 
-  -- ---- bottom rows (one per page, same geometry) ----
   local customBtn = prettyui.SimpleButton.new(body, "Custom", function()
     playSfx(CLICK_SFX)
     local okC, errC = pcall(function() picker.SetMode(true) end)
@@ -237,18 +213,18 @@ local function ensurePicker()
   })
   customParts[#customParts + 1] = setBtn.root
 
-  picker.SetMode(false) -- start on the grid
+  picker.SetMode(false)
 end
 
-local pickerPlace = {} -- uikit.PlaceSatellite state
--- Opens the picker: `apply` receives the picked sprite id (nil = the "no
--- icon" cell), `title` names the grid page, x/y seed the placement.
+local pickerPlace = {}
+-- `apply` receives the picked sprite id, or nil for the "no icon" cell;
+-- x, y are the owner window's position.
 M.Open = function(apply, title, x, y)
   ensurePicker()
   pickerApply = apply
   picker.gridTitle = title or "Preset icon"
-  picker.SetMode(false) -- always open on the grid, custom page reset
-  picker.ClearHighlight() -- never open showing a stale hover glow
+  picker.SetMode(false)
+  picker.ClearHighlight()
   uikit.PlaceSatellite(picker.win, pickerPlace, bankutil.HasColumn(),
     (x or 300) + 30, (y or 160) + 30, 330, 190)
   syncWindowChrome(picker.win)
@@ -272,7 +248,6 @@ M.Close = function()
   if picker then pcall(function() picker.win:Close() end) end
 end
 
--- The picker window (or nil), for pvwin's over-a-satellite hit tests.
 M.Window = function()
   return picker and picker.win or nil
 end

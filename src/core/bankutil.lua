@@ -1,46 +1,35 @@
--- BankUtil Core integration: the connection lifecycle to the `bankcore`
--- plugin, and view control for the preset page Core draws on our behalf.
---
--- While integration is active the vault's view buttons route here instead of to
--- ui/bankpage, and the preset is rendered by ui/bupage through Core's custom
--- view. Our own panel engine is the fallback when Core is absent, disabled,
--- or the setting is off.
---
--- Core IS an optional dependency and the dev manifest declares it as one.
--- Detection is runtime in both builds, against two globals: the
--- client-injected `bankcore` while that manifest declaration is live, and
--- otherwise `__bankcore_api`, the shared API global Core publishes for
--- exactly this purpose. Either way integration lights up for players who
--- have Core and stays silent for players who do not.
+-- Bank Core integration: finds the optional `bankcore` plugin, keeps the
+-- extension registered, and opens and closes the preset view that Core
+-- draws through ui/bupage.
 local M = {}
+local prefs = require("core/prefs")
 
 local EXT_ID = "presetvault"
 local EXT_NAME = "Preset Vault"
 local ICON_SPRITE = 18733 -- CHILD_HEADER_ICON_WORN
 local ICON_FALLBACK = "OUTFIT" -- for a Core that refuses numeric icons
 
-local ext = nil -- live extension handle; nil = not registered
-local extHasColumn = false -- whether the live registration carries the column
-local sharedAtConnect = nil -- __bankcore_api as of the successful Connect
-local activeId = nil -- preset id whose page we last opened
+local ext = nil
+local extHasColumn = false
+-- __bankcore_api as of the last Connect; a different table means Core reloaded
+local sharedAtConnect = nil
+local activeId = nil
 local activePreset = nil
 
-M.OnViewChanged = nil -- ui/pvwin hook, fired after open/close/external close
+M.OnViewChanged = nil -- hook, fired after the view opens or closes
 
 local function fireViewChanged()
   if M.OnViewChanged then pcall(M.OnViewChanged) end
 end
 
--- The custom-view drawer's callbacks (ui/bupage.Provider: draw + stop),
--- injected by main.lua before Connect.
+-- { draw, stop }, injected by main.lua before Connect
 local viewProvider = nil
 M.SetViewProvider = function(callbacks)
   viewProvider = callbacks
 end
 
 local function clearActive()
-  -- stop() runs unconditionally, BEFORE the early return: the drawer's live
-  -- layer must be torn down even if we had no view recorded.
+  -- stop runs before the early return: the live layer dies even with no view recorded
   if viewProvider ~= nil then pcall(viewProvider.stop) end
   if activeId == nil then return end
   activeId, activePreset = nil, nil
@@ -60,16 +49,14 @@ M.CoreDetected = function()
 end
 
 M.Enabled = function()
-  return PersistentDB:GetBool("ui.bankUtilOff") ~= true
+  return prefs.GetBool("ui.bankUtilOff") ~= true
 end
 
--- Registered and usable right now.
 M.IsActive = function()
   return ext ~= nil
 end
 
--- The sidebar column's { mount, resize, unmount } callbacks (ui/bucolumn),
--- injected by main.lua before Connect.
+-- { mount, resize, unmount }, injected by main.lua before Connect
 local columnProvider = nil
 M.SetColumnProvider = function(callbacks)
   columnProvider = callbacks
@@ -80,22 +67,18 @@ local function registrationSpec(icon)
     id = EXT_ID,
     name = EXT_NAME,
     icon = icon,
-    -- No icon means no column either - Core will not accept one without
-    -- the other.
+    -- Core refuses a column without an icon
     column = (icon ~= nil) and columnProvider or nil,
-    -- Core calls the drawer on open, on Refresh, and after every bank item
-    -- change; the drawer reads the preset back via M.ViewPreset().
     customView = (viewProvider ~= nil)
       and function(view) return viewProvider.draw(view) end or nil,
-    -- Our view stopped showing: native tab, another plugin's page, a close,
-    -- or a failed redraw.
     onClose = function() clearActive() end,
     onBankClose = function() clearActive() end,
   }
 end
 
--- Registers with the first icon Core accepts, falling back to no rail icon.
--- Returns the handle, plus whether that registration carried the column.
+-- Returns the handle and whether the registration carries the column. An
+-- icon Core cannot accept fails the whole registration with "invalid"; only
+-- that reason is worth retrying with another icon.
 local function tryRegister(core)
   if core == nil or type(core.Register) ~= "function" then return nil, false end
   for _, icon in ipairs({ ICON_SPRITE, ICON_FALLBACK }) do
@@ -126,7 +109,8 @@ M.Disconnect = function()
   clearActive()
 end
 
--- Registers, or re-registers, with whichever API answers.
+-- A stale injected API answers "stopped" after a Core reload, so the shared
+-- one is tried second.
 M.Connect = function()
   M.Disconnect()
   if not M.Enabled() then return false end
@@ -144,13 +128,12 @@ M.Connect = function()
   return true
 end
 
--- Whether the live registration includes the sidebar column.
 M.HasColumn = function()
   return ext ~= nil and extHasColumn
 end
 
--- Reconnect check, polled from main.lua's 5-tick heartbeat. Handles Core
--- loading late, reloading (a new table) and stopping (nil).
+-- Polled by main.lua: covers Core loading late, reloading (a new shared
+-- table) and stopping (nil).
 M.Heartbeat = function()
   if not M.Enabled() then
     if ext ~= nil then M.Disconnect() end
@@ -166,10 +149,8 @@ M.Heartbeat = function()
   end
 end
 
--- ---- view control -----------------------------------------------------------
-
--- Opens the preset's view. Returns true, or false plus Core's refusal
--- reason. The active record is set BEFORE Open and rolled back on refusal.
+-- Returns true, or false plus Core's refusal reason. The record is set
+-- before Open because Core draws inside Open, and is rolled back on refusal.
 M.ShowPreset = function(preset)
   if ext == nil then return false, "inactive" end
   local prevId, prevPreset = activeId, activePreset
@@ -184,19 +165,18 @@ M.ShowPreset = function(preset)
   return true
 end
 
--- The preset the custom-view drawer should render.
+-- No IsOpen check: the first drawing runs before Core reports the view open.
 M.ViewPreset = function()
   return activePreset
 end
 
--- Queues a redraw of our shown view, for setting changes on our side.
 M.Refresh = function()
   if ext == nil then return end
   pcall(function() ext:Refresh() end)
 end
 
--- Core's own bank read: one { objectID, quantity } per native stack,
--- placeholders included at quantity 0. nil when unavailable.
+-- One { objectID, quantity } per native stack, placeholders included at
+-- quantity 0. nil when Core cannot read the bank.
 M.GetBankItems = function()
   if ext == nil then return nil end
   local items = nil
@@ -204,9 +184,8 @@ M.GetBankItems = function()
   return items
 end
 
--- True when Core reports a native bank search OR filter is active; nil when
--- Core cannot answer (pre-1.5, or a non-English client where the labels do
--- not match), so the caller simply does not bail.
+-- nil when Core cannot tell: no GetBankState, or a non-English client (its
+-- detection matches English labels).
 M.NativeSearchActive = function()
   if ext == nil or ext.GetBankState == nil then return nil end
   local state = nil
@@ -215,15 +194,13 @@ M.NativeSearchActive = function()
   return state.searchActive == true or state.filterActive == true
 end
 
--- Returns the bank to its native view if our page is the one showing.
 M.Hide = function()
   if ext == nil then return end
   pcall(function() ext:Close() end)
   clearActive()
 end
 
--- The preset whose page the bank is showing NOW, verified against Core's
--- own IsOpen rather than trusting our record alone.
+-- Checked against IsOpen: Core can close the page a tick before onClose lands.
 M.ActivePresetId = function()
   if ext == nil or activeId == nil then return nil end
   local open = false

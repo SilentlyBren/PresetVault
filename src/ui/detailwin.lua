@@ -1,11 +1,6 @@
--- The preset detail window: a persistent satellite showing one preset's
--- contents - name field, icon button, paper-doll worn layout, and the
--- backpack / Beast of Burden grid - with a share button in its title bar.
--- Standalone-UI only: in BankUtil mode the bank itself is the preview.
---
--- pvwin.lua requires this module and injects what it owns through
--- M.Configure: host layer, anchor position, relayout, close notification,
--- row-label sync.
+-- The preset detail window: one preset's name, icon, worn doll and backpack
+-- or Beast of Burden grid. ui/pvwin configures it through M.Configure; this
+-- module must never require ui/pvwin back.
 local M = {}
 
 local store = require("core/store")
@@ -19,56 +14,46 @@ local setButtonSprites = uikit.SetButtonSprites
 local attachDelayedTooltip = uikit.AttachDelayedTooltip
 local CLICK_SFX = uikit.CLICK_SFX
 
-local BORDER, TITLE_H = 8, 32 -- PrettyUI Window chrome metrics
-local DETAIL_W = 324 -- right edge sits 8px off the slot grid, matching the left
-local SLOT = 42 -- 40px slot + 2px gap
+local BORDER, TITLE_H = 8, 32
+local DETAIL_W = 324
+local SLOT = 42
 
--- Title-bar button metrics: 24px, centred in the 32px bar.
 local TITLE_BTN_SIZE = 24
 local TITLE_BTN_X, TITLE_BTN_Y = 8, 4
--- The matching right-hand dead zone (PrettyUI's own close button) lives in
--- uikit.ApplyTitleInset; only OUR left-hand reservation is derived here.
 local TITLE_DRAG_INSET = TITLE_BTN_X + TITLE_BTN_SIZE + 4
--- Share icon, normal and hover.
 local SHARE_SPRITE, SHARE_SPRITE_HOVER = 26769, 26770
 
--- Injected by pvwin.lua (see header): { host, anchor(), relayout(),
--- onClosed(), renameRow(id, name) }. anchor returns x, y or nil.
+-- { host, anchor(), relayout(), onClosed(), renameRow(id, name) };
+-- anchor returns x, y or nil.
 local ctx = nil
 M.Configure = function(c)
   ctx = c
 end
 
-local detail -- { win, nameField, wornSlots, packSlots, ... }
-local detailPreset = nil -- preset currently shown
+local detail
+local detailPreset = nil
 
--- Closes the icon picker and share window with the detail window they
--- belong to.
+-- Called from onClose and from M.Hide; both are needed, because hiding an
+-- already hidden window fires no onClose.
 local function closeChildren()
   iconwin.Close()
   pcall(sharewin.CloseShare)
 end
 
--- Keep the drag handle clear of the title-bar share button: a per-tick
--- re-assert off the uikit heartbeat. Cheap (two free mutations) and
--- self-healing, which it has to be: PrettyUI resets that handle from
--- closures we cannot hook. See uikit.ApplyTitleInset.
+-- Every tick: PrettyUI resets its title drag handle from closures that
+-- cannot be hooked, and the handle swallows clicks on the share button.
 uikit.AddTicker("pvDetailTitleInset", function()
   if detail ~= nil and detail.shareBtn ~= nil then
     uikit.ApplyTitleInset(detail.win, TITLE_DRAG_INSET)
   end
 end)
 
--- Slot geometry, shared by the doll and the backpack/BoB grid so every slot
--- in the window is identical: a 40px box with 32x32 art.
+-- Must stay declared above makeDetailSlot, which reads them as upvalues.
 local WORN_SLOT = 40
 local WORN_ICON_W, WORN_ICON_H = 32, 32
 local WORN_ICON_DX, WORN_ICON_DY = 4, 4
 local SLOT_BG_SPRITE = prettyui.Sprites.ITEM_SLOT_BACKGROUND
 
--- Item names hover as TOOLTIPS rather than filling an in-window readout
--- line, which the window is too narrow for: augmented and charged gear
--- names run well past its width.
 local function detailSlotHover(slot, body)
   slot.bg.clickthrough = false
   attachDelayedTooltip(slot.bg, function()
@@ -79,8 +64,6 @@ local function detailSlotHover(slot, body)
   end, body)
 end
 
--- Geometry defaults to a 40px box with 32x32 art inset 4; both callers
--- pass an inset of 5 instead (see WORN_LAYOUT and the pack grid).
 local function makeDetailSlot(body, x, y, placeholderSprite, box, iw, ih, dx, dy)
   box = box or WORN_SLOT
   iw, ih = iw or WORN_ICON_W, ih or WORN_ICON_H
@@ -122,10 +105,8 @@ local function setDetailSlot(slot, entry)
   end
 end
 
--- Fills the lower grid from the active container and relabels it. The 32
--- pooled slots serve both views: Backpack uses the first 28, a Beast of
--- Burden view uses preset.bob.size of them, and the excess is hidden.
--- The toggle button only appears when the preset carries a bob section.
+-- The 32 pooled slots serve both views: Backpack shows 28, a Beast of
+-- Burden view shows preset.bob.size.
 local function applyDetailContainer()
   if detail == nil or detailPreset == nil then return end
   local bob = detailPreset.bob
@@ -155,15 +136,11 @@ local function applyDetailContainer()
   end
   pcall(function()
     detail.packLabel.content = showBob and "Beast of Burden" or "Backpack"
-    -- the summoning button only exists for presets that captured a BoB
-    -- (it IS the badge); the ring behind it marks the BoB view as active
     local b = detail.bobBtn
     b.bg.hidden = bob == nil
     b.icon.hidden = bob == nil
     b.ring.hidden = bob == nil or not showBob
   end)
-  -- Window bottom hugs the last visible slot row (4 rows normally, 5 for a
-  -- 29+ slot BoB) with the same 8px buffer as the left edge.
   pcall(function()
     local py = detail.PY or 6
     local rows = (visCount > 28) and 5 or 4
@@ -173,42 +150,34 @@ local function applyDetailContainer()
   end)
 end
 
--- Paper-doll worn layout: engine slot index -> { x, y, placeholder sprite }.
--- Native coordinates, offset into place by DOLL_X/DOLL_Y. 12 real slots;
--- engine indices 7/9/12/15-17/19 are padding or removed.
---
--- Relationships taken from the native screen (36px box, 4px gap): near
--- column = box + gap out from centre, far column = box + 24, row pitch =
--- box + gap.
-local WGAP = 6 -- vertical gap between rows (matches the column gap)
-local WCOLGAP = 6 -- horizontal gap: a touch wider, the doll reads cramped
+local WGAP = 6
+local WCOLGAP = 6
 local WPITCH = WORN_SLOT + WGAP
 local WNEAR, WFAR = WORN_SLOT + WCOLGAP, WORN_SLOT + 28
 local WCOL = { c = 0, nl = -WNEAR, nr = WNEAR, fl = -WFAR, fr = WFAR }
 local WROW = { 0, WPITCH, WPITCH * 2, WPITCH * 3, WPITCH * 4 }
--- { engine slot index, column offset, row y, ghosted placeholder sprite }
+-- idx is the engine slot index; x and y are relative to DOLL_X / DOLL_Y.
+-- Placeholder sprites are pinned by number: their enum names register only
+-- once the worn assets load, and resolve to -1 before that.
 local WORN_LAYOUT = {
-  { idx = 1, x = WCOL.c, y = WROW[1], ph = 24431 },   -- head (_0)
-  { idx = 18, x = WCOL.nr, y = WROW[1], ph = 24443 }, -- pouch (_12)
-  { idx = 2, x = WCOL.nl, y = WROW[2], ph = 24432 },  -- cape (_1)
-  { idx = 3, x = WCOL.c, y = WROW[2], ph = 24433 },   -- neck (_2)
-  { idx = 14, x = WCOL.nr, y = WROW[2], ph = 24441 }, -- ammo (_10)
-  { idx = 4, x = WCOL.fl, y = WROW[3], ph = 24434 },  -- main hand (_3)
-  { idx = 5, x = WCOL.c, y = WROW[3], ph = 24436 },   -- body (_5)
-  { idx = 6, x = WCOL.fr, y = WROW[3], ph = 24437 },  -- off hand (_6)
-  { idx = 8, x = WCOL.c, y = WROW[4], ph = 24438 },   -- legs (_7)
-  { idx = 10, x = WCOL.fl, y = WROW[5], ph = 24439 }, -- gloves (_8)
-  { idx = 11, x = WCOL.c, y = WROW[5], ph = 24440 },  -- boots (_9)
-  { idx = 13, x = WCOL.fr, y = WROW[5], ph = 24435 }, -- ring (_4)
+  { idx = 1, x = WCOL.c, y = WROW[1], ph = 24431 },   -- head
+  { idx = 18, x = WCOL.nr, y = WROW[1], ph = 24443 }, -- pouch
+  { idx = 2, x = WCOL.nl, y = WROW[2], ph = 24432 },  -- cape
+  { idx = 3, x = WCOL.c, y = WROW[2], ph = 24433 },   -- neck
+  { idx = 14, x = WCOL.nr, y = WROW[2], ph = 24441 }, -- ammo
+  { idx = 4, x = WCOL.fl, y = WROW[3], ph = 24434 },  -- main hand
+  { idx = 5, x = WCOL.c, y = WROW[3], ph = 24436 },   -- body
+  { idx = 6, x = WCOL.fr, y = WROW[3], ph = 24437 },  -- off hand
+  { idx = 8, x = WCOL.c, y = WROW[4], ph = 24438 },   -- legs
+  { idx = 10, x = WCOL.fl, y = WROW[5], ph = 24439 }, -- gloves
+  { idx = 11, x = WCOL.c, y = WROW[5], ph = 24440 },  -- boots
+  { idx = 13, x = WCOL.fr, y = WROW[5], ph = 24435 }, -- ring
 }
 
--- The game's own connector lines (29313 horizontal art / 29316 vertical -
--- both stretch), re-derived for our box size: stubs fill the row/column
--- gaps, runs fill the 24px ones, long verticals centre on the outer
--- columns. { x, y, w, h, sprite }, x relative to the centre column's left.
+-- { x, y, w, h, sprite }, x relative to the centre column's left edge.
 local WORN_CONNECTORS = {}
 do
-  local T = 10 -- line thickness across its short axis
+  local T = 10
   local mid = (WORN_SLOT - T) // 2
   for r = 1, 4 do
     WORN_CONNECTORS[#WORN_CONNECTORS + 1] =
@@ -226,21 +195,17 @@ do
   WORN_CONNECTORS[#WORN_CONNECTORS + 1] = { WCOL.fl + mid, runY, T, runH, 29316 }
   WORN_CONNECTORS[#WORN_CONNECTORS + 1] = { WCOL.fr + mid, runY, T, runH, 29316 }
 end
--- Centre column x and the doll's top, in window content coords. The
--- backpack grid below spans PX..PX+7*SLOT, so its midpoint less half a slot
--- puts the centre column's left edge on the window's centreline.
 local DOLL_X = 8 + (7 * SLOT) // 2 - WORN_SLOT // 2
 local DOLL_Y = 54
 
 local function ensureDetail()
   if detail then return end
-  local PX, PY = 8, 6 -- inner content padding
+  local PX, PY = 8, 6
   local ok, err = pcall(function()
     local w = prettyui.Window.new(ctx.host, {
       categoryID = "auto",
       title = "Preset",
       x = 460, y = 140,
-      -- 4-slot-row height; applyDetailContainer grows it for 29+ slot BoBs
       width = DETAIL_W,
       height = TITLE_H + 504 + BORDER,
       minWidth = DETAIL_W, minHeight = 160,
@@ -262,8 +227,6 @@ local function ensureDetail()
       width = fieldW,
       maxLength = 25,
       placeholder = "Preset name",
-      -- Persist per keystroke + update title and the visible row label in
-      -- place (mutation is free); no relayout needed.
       onChange = function(_, _, content)
         local okR, errR = pcall(function()
           if not detailPreset then return end
@@ -277,7 +240,6 @@ local function ensureDetail()
         end)
         if not okR then log(formatStr("[PV] rename failed: {}", tostring(errR))) end
       end,
-      -- Re-sort the (alphabetical) list once the rename is committed.
       onSubmit = function()
         ctx.relayout()
       end,
@@ -296,33 +258,25 @@ local function ensureDetail()
     attachDelayedTooltip(swapBtn.root, "Choose a skill icon for this preset", body)
 
     prettyui.Text.new(body, { text = "Worn", x = PX, y = PY + 40, height = 16 })
-    -- the game's own connector lines, drawn BEFORE the slots so the slot
-    -- art sits over their ends
+    -- created before the slots so the slot art draws over the line ends
     for _, c in ipairs(WORN_CONNECTORS) do
       local line = ui.Sprite.new(body)
       line:SetPos(DOLL_X + c[1], DOLL_Y + c[2])
       line:SetSize(c[3], c[4])
       line.spriteID = c[5]
-      pcall(function() line.alpha = 0.5 end) -- soften against the panel
+      pcall(function() line.alpha = 0.5 end)
       line.clickthrough = true
     end
     for _, spec in ipairs(WORN_LAYOUT) do
-      -- art inset 5, not the default 4: the slot art reads a pixel high
-      -- and left against this backdrop
       detail.wornSlots[spec.idx] =
         makeDetailSlot(body, DOLL_X + spec.x, DOLL_Y + spec.y, spec.ph,
           WORN_SLOT, WORN_ICON_W, WORN_ICON_H, WORN_ICON_DX + 1, WORN_ICON_DY + 1)
     end
 
-    -- Section title, with the BoB toggle sharing its row right-aligned to
-    -- the slot grid's edge.
     detail.packLabel = prettyui.Text.new(body, { text = "Backpack", x = PX, y = PY + 300, height = 16 })
-    -- Beast of Burden toggle: the action bar's summoning button art, three
-    -- pooled sprites built once. Its mere PRESENCE says "this preset
-    -- captured a BoB"; a ring behind it marks the BoB view being active.
     local BOB_SIZE, BOB_RING = 30, 38
     local bx = PX + 7 * SLOT - 6 - BOB_SIZE
-    local by = PY + 289 -- sits on the title row, clear of the first slot row
+    local by = PY + 289
     local function mkBobSprite(spriteId, x, y, size, clickthrough)
       local s = ui.Sprite.new(body)
       s:SetPos(x, y)
@@ -345,8 +299,8 @@ local function ensureDetail()
       end)
       if not okT then log(formatStr("[PV] bob toggle failed: {}", tostring(errT))) end
     end)
-    -- hover art rides the tooltip's OWN subscription rather than taking a
-    -- second one on the same hook (see attachDelayedTooltip)
+    -- hover art rides the tooltip's subscription: a second subscription on
+    -- the same hook is unreliable
     attachDelayedTooltip(bob.icon, function()
       return detail.showBob and "Show backpack" or "Show Beast of Burden"
     end, body,
@@ -354,12 +308,9 @@ local function ensureDetail()
       function() pcall(function() bob.icon.spriteID = 18855 end) end)
     detail.bobBtn = bob
 
-    -- 32 pooled slots: rows 1-4 = backpack, row 5 only ever shows for a
-    -- 29+ capacity Beast of Burden view (see applyDetailContainer).
     for i = 1, 32 do
       local col = (i - 1) % 7
       local row = math.floor((i - 1) / 7)
-      -- Same geometry and art inset as the doll slots above.
       detail.packSlots[i] = makeDetailSlot(body, PX + col * SLOT, PY + 320 + row * SLOT,
         nil, nil, nil, nil, WORN_ICON_DX + 1, WORN_ICON_DY + 1)
       if i > 28 then
@@ -367,23 +318,17 @@ local function ensureDetail()
       end
     end
 
-    -- Share button, far left of the title bar, mirroring the close button
-    -- on the right: a bare ui.Sprite on the window ROOT, swapping art on
-    -- hover. applyTitleInset keeps the drag handle off it.
-    -- A raw child on the window ROOT is a managed control, so it goes
-    -- through PrettyUI's guarded constructor where that exists (1.3 auto
-    -- allocation); the direct ui.Sprite.new is the fallback for 1.2.
+    -- On the window root, not the content: content is clipped to its own
+    -- bounds and cannot reach the title bar. prettyui.NewComponent exists
+    -- from PrettyUI 1.3; ui.Sprite.new is the fallback for 1.2.
     detail.shareBtn = prettyui.NewComponent
         and prettyui.NewComponent(ui.Sprite, w.root)
         or ui.Sprite.new(w.root)
     detail.shareBtn:SetPos(TITLE_BTN_X, TITLE_BTN_Y)
     detail.shareBtn:SetSize(TITLE_BTN_SIZE, TITLE_BTN_SIZE)
     detail.shareBtn.spriteID = SHARE_SPRITE
-    -- Must be set explicitly, or the hover and click hooks below never
-    -- fire.
+    -- must be set explicitly, or the hover and click hooks never fire
     detail.shareBtn.clickthrough = false
-    -- hover art rides the tooltip's own subscription, the BoB toggle's
-    -- pattern (a second named sub on the same hook is unreliable)
     attachDelayedTooltip(detail.shareBtn, "Share this preset as a code", body,
       function()
         pcall(function() detail.shareBtn.spriteID = SHARE_SPRITE_HOVER end)
@@ -422,7 +367,6 @@ M.Show = function(preset)
     detailPreset = preset
     detail.win:SetTitle(preset.name)
     detail.nameField:SetText(preset.name)
-    -- Worn entries carry their engine slot index; place each on the doll.
     local byIdx = {}
     for _, e in ipairs(preset.equipment) do
       byIdx[e.slot] = e
@@ -430,8 +374,6 @@ M.Show = function(preset)
     for _, spec in ipairs(WORN_LAYOUT) do
       setDetailSlot(detail.wornSlots[spec.idx], byIdx[spec.idx])
     end
-    -- lower grid always opens on Backpack; the BoB toggle shows only when
-    -- this preset carries a bob section
     detail.showBob = false
     applyDetailContainer()
     local ax, ay = ctx.anchor()
@@ -442,12 +384,11 @@ M.Show = function(preset)
   if not ok then log(formatStr("[PV] detail show failed: {}", tostring(err))) end
 end
 
--- The detail window (or nil), for pvwin's over-a-satellite hit tests.
 M.Window = function()
   return detail and detail.win or nil
 end
 
--- Current position (or nil when never built), the share window's anchor.
+-- x, y, or nothing when the window has never been built.
 M.Position = function()
   if detail then return detail.win.root.x, detail.win.root.y end
 end

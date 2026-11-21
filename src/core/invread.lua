@@ -1,7 +1,8 @@
 -- Shared inventory readers. Ids: 93 backpack, 94 worn, 95 bank, 530 BoB.
+-- An unreadable inventory reads as empty.
 local M = {}
 
--- Total units per obj id in an inventory.
+-- { [objId] = total units }
 M.CountInv = function(invId)
   local counts = {}
   pcall(function()
@@ -18,7 +19,7 @@ M.CountInv = function(invId)
   return counts
 end
 
--- Per-slot contents: { [slot] = { obj, count } }.
+-- { [slot] = { obj, count } }
 M.Slots = function(invId)
   local held = {}
   pcall(function()
@@ -36,7 +37,7 @@ M.Slots = function(invId)
   return held
 end
 
--- What the player holds, per container, keyed by preset section name.
+-- Keyed by preset section name; the three containers stay separate.
 M.Carried = function()
   return { backpack = M.CountInv(93), equipment = M.CountInv(94),
     bob = M.CountInv(530) }

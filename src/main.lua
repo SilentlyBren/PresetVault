@@ -1,14 +1,9 @@
--- Preset Vault: unlimited gear/inventory preset manager.
---
--- Lifecycle and wiring only. The implementation is in core/ (data systems,
--- no UI) and ui/ (everything that draws).
---
--- This plugin READS game state and renders UI. It never sends actions, makes
--- network calls, or automates anything: the player clicks, we only display
--- and organise. One optional permission is requested, trackingAccess, used
--- solely to tell characters apart for per-character vaults.
+-- Preset Vault: lifecycle and wiring only. core/ holds the data systems,
+-- ui/ everything that draws. The plugin reads game state and renders UI; it
+-- never sends actions or makes network calls.
 
 log("[PV] loading...")
+local prefs = require("core/prefs")
 
 local window = require("ui/pvwin")
 local bankpage = require("ui/bankpage")
@@ -21,27 +16,23 @@ local uikit = require("ui/uikit")
 local settings = require("ui/settings")
 local ribbon = require("ui/ribbon")
 
--- Register with BankUtil Core, injecting the sidebar column and custom-view
--- drawer first. Core is OPTIONAL - everything works without it.
+-- the providers must be set before Connect
 bankutil.SetColumnProvider(bucolumn.Provider)
 bankutil.SetViewProvider(bupage.Provider)
 pcall(bankutil.Connect)
--- The side-panel discrepancy overlay; draws only while a preset view is on.
 pcall(overlay.Init)
 
--- A dependency was enabled or disabled; let the heartbeat work out what
--- that means for us.
+-- A nudge only, and it never inspects the event: Heartbeat detects Bank Core
+-- arriving, reloading or leaving by itself.
 function PluginDependencyUpdate()
   pcall(bankutil.Heartbeat)
 end
 
--- The Plugin Hub's Settings button hands us an empty layer to fill.
 local function onSettingsLayer(event)
   settings.Build(event.component)
 end
 Event.SettingsLayerReady.Subscribe("pvSettingsLayer", onSettingsLayer)
 
--- The ribbon icon's content layer, rebuilt on each "on" transition.
 local function onContentLayer(event)
   ribbon.Build(event.component)
 end
@@ -49,14 +40,14 @@ Event.ContentLayerReady.Subscribe("pvContentLayer", onContentLayer)
 
 local bankWasOpen = false
 local function applyBankState(bankNow)
-  -- On bank close, our chrome is torn down and rebuilt next session.
+  -- The client detaches plugin children of bank components on close: the
+  -- handles keep answering but never render again, so chrome is destroyed.
   if bankWasOpen and not bankNow then
     bankpage.Restore() -- event path can land before bankpage's own tick
     bankpage.DestroyChrome()
-    pcall(overlay.DestroyChrome) -- side-panel chrome detaches the same way
-    -- force-open is a bank-session override in auto mode only; a manual-mode
-    -- window outlives the bank
-    if PersistentDB:GetBool("ui.manualMode") ~= true then
+    pcall(overlay.DestroyChrome)
+    -- WantOpen lasts one bank session, except in manual mode
+    if prefs.GetBool("ui.manualMode") ~= true then
       window.ClearWantOpen()
     end
   end
@@ -64,9 +55,9 @@ local function applyBankState(bankNow)
 
   local open
   if bankutil.HasColumn() then
-    -- Integration owns the UI outright: the column IS the vault.
+    -- HasColumn, not Enabled: a registration without a column keeps the window
     open = false
-  elseif PersistentDB:GetBool("ui.manualMode") == true then
+  elseif prefs.GetBool("ui.manualMode") == true then
     open = window.WantOpen()
   else
     open = bankNow or window.WantOpen()
@@ -79,13 +70,13 @@ local function applyBankState(bankNow)
   end
 end
 
+-- core/identity's RESOLVE_TIMEOUT counts these polls: change both together.
+local POLL_TICKS = 10
 local identityWasReady = nil
 local function bankWindowTick(event)
-  if event.logicTick % 5 ~= 0 then return end
+  if event.logicTick % POLL_TICKS ~= 0 then return end
   identity.Update()
   pcall(bankutil.Heartbeat)
-  -- Every surface that can show the vault-locked notice redraws when the
-  -- identity state changes.
   local ready = identity.State()
   if ready ~= identityWasReady then
     identityWasReady = ready
@@ -97,7 +88,6 @@ local function bankWindowTick(event)
 end
 Event.Logic.Subscribe("pvBankWindow", bankWindowTick)
 
--- Drops the cached identity so it is re-resolved before the vault reopens.
 local function forgetIdentity()
   pcall(function()
     identity.Forget()
@@ -108,8 +98,8 @@ end
 Event.GameStateChanged.Subscribe("pvIdentityState", forgetIdentity)
 Event.OptionalPermissionChanged.Subscribe("pvIdentityPerm", forgetIdentity)
 
--- Bank open/close timing: inv 95 is added on open, removed on close. The
--- readability poll stays the source of truth; this only makes it prompt.
+-- Inventory 95 is the bank. Timing only: the poll still decides visibility,
+-- so a spurious add (inventories streaming in at login) cannot flash the window.
 local function onBankInvEvent(event)
   pcall(function()
     if event.inv ~= nil and event.inv.id == 95 then
@@ -128,12 +118,13 @@ function PluginShutdown()
   Event.InventoryRemoved.Unsubscribe("pvBankInvRm")
   Event.GameStateChanged.Unsubscribe("pvIdentityState")
   Event.OptionalPermissionChanged.Unsubscribe("pvIdentityPerm")
-  bankpage.Restore() -- hand the bank back untouched if a view was active
-  bankpage.DestroyChrome() -- chrome survives Restore; only shutdown kills it
-  overlay.Shutdown() -- side-panel overlay: tick + chrome
-  bankutil.Disconnect() -- release the Core extension (removes icon + view)
-  bucolumn.Shutdown() -- the right-click menu subscription
-  uikit.Shutdown() -- the shared UI heartbeat (tooltips, drags, timers)
+  -- Restore first: it unsets the opConfig flags, which needs the chrome alive
+  bankpage.Restore()
+  bankpage.DestroyChrome()
+  overlay.Shutdown()
+  bankutil.Disconnect()
+  bucolumn.Shutdown()
+  uikit.Shutdown()
   window.Destroy()
   log("[PV] Preset Vault unloaded")
 end

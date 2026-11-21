@@ -1,8 +1,6 @@
--- The two sharing windows: Share Code (export) and Import Code. The codec
--- itself is core/sharecode.
---
--- pvwin.lua requires this module and injects what it owns through
--- M.Configure: host layer, window positions, relayout, collapse-key helper.
+-- The two sharing windows: Share Code (export) and Import Code.
+-- ui/pvwin requires this module and configures it; this module must never
+-- require pvwin back.
 local M = {}
 
 local sharecode = require("core/sharecode")
@@ -12,26 +10,19 @@ local bankutil = require("core/bankutil")
 
 local IMPORT_SFX = 31899
 
-local BORDER, TITLE_H = 8, 32 -- PrettyUI Window chrome metrics
+local BORDER, TITLE_H = 8, 32
 
--- Injected by pvwin.lua (see header): { host, shareAnchor(), importAnchor(),
--- relayout(), expandUncat() }. Anchor functions return x, y or nil.
+-- { host, shareAnchor(), importAnchor(), relayout(), expandUncat() }.
+-- Anchor functions return x, y or nil.
 local ctx = nil
 M.Configure = function(c)
   ctx = c
 end
 
--- uikit.PlaceSatellite state, one table per satellite window.
 local sharePlace, importPlace = {}, {}
 
--- ---- share code window (persistent) -------------------------------------------
--- Shows one preset's share code in a box the player can copy out of but not
--- keep an edit to. Opened from the preset detail window's title bar.
---
--- The box is made read-only by HEALING: any edit is immediately rewritten
--- with the code.
 local share -- { win, field, code }
-local shareHealing = false -- re-entry guard for the self-healing field
+local shareHealing = false
 local SHARE_W = 380
 
 local function ensureShareWindow()
@@ -60,9 +51,9 @@ local function ensureShareWindow()
       x = PX, y = PY + 24,
       width = SHARE_W - BORDER * 2 - PX * 2,
       maxLength = 2048,
+      -- No read-only field mode exists: any edit is rewritten with the code.
       onChange = function()
-        -- Re-entry guard: the heal below writes the field, which can fire
-        -- this handler again.
+        -- A programmatic write can fire the native change hook.
         if shareHealing then return end
         shareHealing = true
         pcall(function()
@@ -94,7 +85,6 @@ M.OpenShare = function(preset)
       share.field:SetText("")
       share.field:SetPlaceholder("Cannot share: " .. tostring(codeErr))
     else
-      -- Handed over wrapped in backticks.
       share.code = sharecode.Wrap(code)
       share.field:SetPlaceholder("")
       share.field:SetText(share.code)
@@ -105,8 +95,8 @@ M.OpenShare = function(preset)
     uikit.SyncWindowChrome(share.win)
     share.win:Show()
   end)
-  -- Cleared OUTSIDE the pcall: left stuck true by an error on the way
-  -- through, the field would quietly stop healing and become editable.
+  -- Cleared outside the pcall: stuck true after an error, the field would
+  -- stop healing and become editable.
   shareHealing = false
   if not ok then log(formatStr("[PV] share open failed: {}", tostring(err))) end
 end
@@ -115,12 +105,10 @@ M.CloseShare = function()
   if share then pcall(function() share.win:Close() end) end
 end
 
--- ---- import code window (persistent) ------------------------------------------
--- Paste a code, get a preset in this vault. Nothing is written until a whole
--- preset has decoded cleanly, so a bad code cannot leave a half-import.
 local importWin -- { win, field, status }
 local IMPORT_W = 330
--- The last content we know about, plus a guard for our own writes.
+-- onChange also fires on submit and focus loss, so a player edit is
+-- detected by comparing content, and our own writes are suppressed.
 local importLastText = ""
 local importSuppress = false
 
@@ -132,8 +120,6 @@ local function setImportStatus(text, bad)
   end)
 end
 
--- Writes the code box without the write looking like a player edit, keeping
--- importLastText in step.
 local function setImportText(s)
   if importWin == nil or importWin.field == nil then return end
   importSuppress = true
@@ -142,7 +128,6 @@ local function setImportText(s)
   importSuppress = false
 end
 
--- Resets the window to blank.
 local function resetImportWindow()
   if importWin == nil then return end
   setImportText("")
@@ -176,8 +161,6 @@ local function ensureImportWindow()
       width = IMPORT_W - BORDER * 2 - PX * 2,
       maxLength = 2048,
       placeholder = "PV1-...",
-      -- Clears a stale result as soon as the box is EDITED, gated on the
-      -- content actually differing.
       onChange = function(f)
         if importSuppress then return end
         local now = ""
@@ -203,29 +186,23 @@ local function ensureImportWindow()
         end)
         if preset == nil then
           uikit.PlaySfx(uikit.BLOCKED_SFX)
-          -- The specific reason goes to the console; the status line stays
-          -- terse.
           log(formatStr("[PV] import rejected: {}", tostring(decodeErr)))
           setImportStatus("Invalid share code", true)
           return
         end
         local stored = store.Import(preset)
         if stored == nil then
-          -- A locked vault is NOT an invalid code, and says so separately.
           uikit.PlaySfx(uikit.BLOCKED_SFX)
           setImportStatus("Cannot import - vault locked", true)
           return
         end
-        -- Box cleared BEFORE the status is set, via setImportText.
+        -- The box is cleared before the status is set, never after.
         setImportText("")
         uikit.PlaySfx(IMPORT_SFX)
         setImportStatus("Import success", false)
-        -- The detail lives in the console, where it costs no layout.
         local n = #(stored.equipment or {}) + #(stored.backpack or {})
         if stored.bob ~= nil then n = n + #(stored.bob.items or {}) end
         log(formatStr("[PV] imported '{}' ({} items)", stored.name, n))
-        -- An import always lands in Uncategorised (codes carry no
-        -- category); expand it so the arrival is visible, as Save does.
         ctx.expandUncat()
         ctx.relayout()
       end)
@@ -262,8 +239,7 @@ M.OpenImport = function()
   end)
 end
 
--- The share and import window handles, two values, either possibly nil
--- (never built) - for the vault window's edit-mode occlusion guard.
+-- Returns the share and import window handles; either may be nil.
 M.Windows = function()
   return share and share.win, importWin and importWin.win
 end

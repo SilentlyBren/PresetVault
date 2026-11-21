@@ -19,6 +19,7 @@ withdrawal is the player's own click.
 |---|---|
 | `snapshot.lua` | Captures worn + backpack + BoB into a preset; familiar capacity read from game config. |
 | `store.lua` | All vault persistence: presets, categories and their icons, manual ordering; selects which vault key is in use. Strips markup from names. |
+| `prefs.lua` | The on/off settings: read from PersistentDB once, served from memory, and the only route to them. |
 | `identity.lua` | Character identity via `Player.GetTrackingID()` for per-character vaults; permission and resolve states. |
 | `sharecode.lua` | Share-code codec (`PV1-` base64), encode and decode. Pure. |
 | `presetview.lua` | The bank-view model both engines consume: geometry, cell building, live top-up satisfaction, the one-click op ladder, badge rules. Pure. |
@@ -46,8 +47,8 @@ withdrawal is the player's own click.
 - **Saving**: `pvwin`/`bucolumn` → `snapshot` captures → `store` writes.
 - **Storage**: `store` owns every read and write of vault data; `identity`
   decides which vault key it uses (shared, or one per character). Settings
-  are plain PersistentDB flags (`ui.*`), written by `settings` and read live
-  by whichever module they govern.
+  are PersistentDB flags held by `prefs`: `settings` writes them through it
+  and the module each one governs reads it live.
 - **Bank view**: `presetview` computes everything; `bankpage` (standalone)
   or `bupage` (through Bank Core) draws it. `bankutil` manages the
   Core connection and which engine owns the view; `bucolumn` is the

@@ -1,17 +1,8 @@
 -- The main Preset Vault window: the standalone vault UI, built on PrettyUI.
--- Its satellite windows live in their own modules - the detail window in
--- ui/detailwin, the icon picker in ui/iconwin, share/import in ui/sharewin -
--- each configured from here and never requiring this module back.
---
--- BUILD-ONCE ARCHITECTURE - everything here is built once and updated in
--- place:
---   * preset rows and category headers live in reusable pools, hidden when
---     unused, then positioned and re-labelled on each relayout();
---   * ONE shared tooltip, ONE drag ghost, ONE inline rename field, and the
---     persistent satellite windows above.
--- Mutating properties (content, spriteID, position, hidden) costs nothing;
--- only *.new() does real work.
+-- It configures the satellite windows (ui/detailwin, ui/iconwin,
+-- ui/sharewin); none of them may require this module back.
 local M = {}
+local prefs = require("core/prefs")
 
 local store = require("core/store")
 local snapshot = require("core/snapshot")
@@ -22,66 +13,48 @@ local sharewin = require("ui/sharewin")
 local iconwin = require("ui/iconwin")
 local detailwin = require("ui/detailwin")
 
--- Shared plumbing lives in ui/uikit (sounds, the one-tooltip-per-window
--- system, window-chrome repairs), aliased locally to keep the call sites
--- below short.
 local playSfx, playRandomSfx = uikit.PlaySfx, uikit.PlayRandomSfx
 local centreTitle, syncWindowChrome = uikit.CentreTitle, uikit.SyncWindowChrome
 local setButtonSprites = uikit.SetButtonSprites
 local attachDelayedTooltip, hideTip = uikit.AttachDelayedTooltip, uikit.HideTip
 local BLOCKED_SFX = uikit.BLOCKED_SFX
 
--- CLICK is the light "UI notch" on interactive buttons; SAVE is a bigger
--- confirm for "Save current gear".
 local CLICK_SFX = uikit.CLICK_SFX
 local SAVE_SFX = 20223
--- Bank preset view open/close: a matched pair from one sprite family,
--- played randomly as the client itself does, so toggling reads as one
--- action in one voice.
 local BANKVIEW_ON_SFX = { 59077, 59078, 59079, 59080, 59081, 59082 }
 local BANKVIEW_OFF_SFX = { 59073, 59074, 59075, 59076 }
-local CATEGORY_TOGGLE_SFX = 25537 -- accordion open/close
--- The plugin hub's permissions-button chime, played randomly from its five
--- variants as the client itself does, so it blends in.
+local CATEGORY_TOGGLE_SFX = 25537
 local EYE_SFX = { 59087, 59088, 59089, 59090, 59091 }
-local DROP_SFX = uikit.DROP_SFX -- confirmed drag-drop: category reordered /
--- preset recategorised (shared with the column's "Move to >")
+local DROP_SFX = uikit.DROP_SFX
 
--- List theme: headers and preset rows are flat rows in one continuous
--- zebra - an expanded header goes soft gold with a thin accent strip
--- uniting it with its rows, hover lifts a single row's fill.
-local ROW_ODD = 0x211E1BCC -- zebra bands at 80% alpha; state fills opaque
+local ROW_ODD = 0x211E1BCC
 local ROW_EVEN = 0x2A2622CC
 local ROW_HOVER = 0x403728FF
-local ROW_SELECTED = 0x49371FFF -- fill while the preset's bank view is live
-local ROW_TEXT_RGBA = 0xD7D0BFFF -- preset names
+local ROW_SELECTED = 0x49371FFF
+local ROW_TEXT_RGBA = 0xD7D0BFFF
 local SELECTED_BORDER = 0xD2A84DFF
-local HEADING_TEXT = 0xD1BF9AFF -- category names
-local HEADING_EXPANDED = 0x3B3222FF -- soft gold, well under ROW_SELECTED
+local HEADING_TEXT = 0xD1BF9AFF
+local HEADING_EXPANDED = 0x3B3222FF
 local HEADING_EXPANDED_HOVER = 0x463A26FF
-local ACCENT_W = 2 -- the strip down the far left of an expanded section
+local ACCENT_W = 2
 local ACCENT_RGBA = 0xD2A84D90
--- 1px separator, drawn only where a header sits below an EXPANDED card -
--- without it, back-to-back expanded sections merge their accent strips.
 local CARD_SEP_RGBA = 0x756C60FF
--- Header collapse chevron, far right of the row.
+-- The sprite faces up. rotationDegrees is anticlockwise-positive and a
+-- negative angle does not rotate.
 local ARROW_SPRITE = 8085
-local ARROW_COLLAPSED_DEG = 270 -- anticlockwise 270 = 90 clockwise: up -> right
-local ARROW_EXPANDED_DEG = 180 -- half turn: up -> down
+local ARROW_COLLAPSED_DEG = 270
+local ARROW_EXPANDED_DEG = 180
 local ARROW_SIZE = 16
-local ARROW_PAD = 4 -- chevron inset from the row's right edge
--- Preview cell: the end of a preset row, closed off by a hairline.
+local ARROW_PAD = 4
 local VIEW_CELL_W = 30
-local VIEW_DIV_INSET = 0 -- hairline shortfall top and bottom
+local VIEW_DIV_INSET = 0
 local VIEW_DIV_RGBA = 0xD7D0BF26
 local VIEW_HOVER_RGBA = 0xD7D0BF1E
 local VIEW_OPEN_RGBA = 0xD2A84D40
 local VIEW_GLYPH_SIZE = 20
 local VIEW_SPRITE, VIEW_SPRITE_LIT = 6247, 6247
-local VIEW_GLYPH_DIM = 0.78 -- glyph alpha at rest
--- Headers and rows share one MUSEO face - a step up from bucolumn's
--- smallest, since the window has more room than the bank sidebar. Guarded
--- like uikit.SmallFont: a missing enum reads -1, never nil.
+local VIEW_GLYPH_DIM = 0.78
+-- A missing font enum reads -1, never nil.
 local LIST_FONT = (function()
   local f = nil
   pcall(function() f = id.Font.MUSEO_SANS_13PT_REGULAR end)
@@ -90,46 +63,38 @@ local LIST_FONT = (function()
 end)()
 
 local WIN_W, WIN_H = 360, 440
-local BORDER, TITLE_H = 8, 32 -- PrettyUI Window chrome metrics
+local BORDER, TITLE_H = 8, 32
 local SCROLLBAR_W = 18
 local USABLE = WIN_W - BORDER * 2 - SCROLLBAR_W
 local TOP_Y = 8
--- The top-right icon cluster: 26px buttons, 6px gaps, left to right
--- SEARCH / EDIT / + / IMPORT. Positions derive from the slot index counting
--- from the RIGHT, so adding or removing one is a change to TOP_BTN_COUNT.
--- Everything else centred in the top bar spans USABLE minus this.
 local TOP_BTN, TOP_BTN_GAP = 26, 6
 local TOP_BTN_COUNT = 4
 local TOP_BTNS_W = TOP_BTN_COUNT * (TOP_BTN + TOP_BTN_GAP) - TOP_BTN_GAP
--- Slot 1 is the FAR RIGHT button, slot 2 its left neighbour, and so on.
+-- Slot 1 is the far-right button.
 local function topBtnX(slotFromRight)
   return USABLE - slotFromRight * (TOP_BTN + TOP_BTN_GAP) + TOP_BTN_GAP
 end
 local TOP_SLOT_IMPORT, TOP_SLOT_PLUS, TOP_SLOT_EDIT, TOP_SLOT_SEARCH = 1, 2, 3, 4
--- Import-code icon, shared look with the BankUtil column's import button.
 local IMPORT_SPRITE = 29456
 local LIST_Y = 50
-local ROW_H = 30 -- headers use the same height: they are rows in the flow
-local CAT_INDENT = 8 -- extra left indent on rows sitting under a header
+local ROW_H = 30
+local CAT_INDENT = 8
 local UNCAT = "Uncategorised"
--- Sentinel pseudo-category holding every preset when categories are off. The
--- \0 makes it impossible to collide with a real (user-typed) category name.
+-- The group holding every preset in flat mode; "\0" cannot be typed into a
+-- category name.
 local FLAT = "\0flat"
 
--- Collapse state is SESSION-ONLY, in memory: every category starts
--- collapsed each session, and nothing about it touches PersistentDB.
+-- Session-only: absent = collapsed, true = expanded.
 local expandedCats = {}
 local function isCollapsed(cat)
   return expandedCats[cat] ~= true
 end
 local function setCollapsed(cat, collapsed)
   if cat == nil then return end
-  expandedCats[cat] = (not collapsed) or nil -- never keep false entries
+  expandedCats[cat] = (not collapsed) or nil
 end
 
--- The lock-state notice, up to NOTICE_LINES short lines: the reason, then
--- the way out of it. Shared with the BankUtil column (M.LockLines) so the
--- two surfaces always say the same thing.
+-- Shared with the Bank Core column, whose lines fit about 30 characters.
 local NOTICE_LINES = 4
 local function lockLines(lockState)
   return (lockState == "resolving" and { "Identifying character..." })
@@ -142,77 +107,61 @@ local function lockLines(lockState)
     or {}
 end
 
--- ---- module state -----------------------------------------------------------
-local host -- the plugin build layer the windows live in
-local win -- prettyui.Window (main vault)
-local list -- prettyui.SimpleView: the scrolling preset list under the top bar
-local rowPool = {} -- reusable preset-row widget sets
-local headerPool = {} -- reusable category-header widget sets
-local hintPool = {} -- reusable empty-category hint texts
-local sepPool = {} -- reusable 1px card separators (see CARD_SEP_RGBA)
-local renameField, renameOk -- the single inline category-rename pair
-local commitRename -- commits an in-progress category rename (set with the pair)
-local ghost -- the single drag ghost (SimpleButton, hidden when idle)
-local selectedId = nil -- preset whose detail window is open (row highlight)
+local host
+local win
+local list -- prettyui.SimpleView; every list item is a child of list.content
+local rowPool = {}
+local headerPool = {}
+local hintPool = {}
+local sepPool = {}
+local renameField, renameOk
+local commitRename
+local ghost
+local selectedId = nil -- preset whose detail window is open
 local editingCat = nil
-local editMode = false -- rename/delete buttons + drag-to-rearrange only when on
+local editMode = false
 -- One per category band, top to bottom: { cat, y0, y1, flat, headed, rows },
 -- rows = { id, y0, y1 } per rendered preset row. All in list content coords.
 local dropZones = {}
 local dragOrderIdx = {} -- store.PresetOrderIndex() as of the last relayout
-local dropLine -- the insertion line shown during a drag
-local lastListW = 0 -- row width of the last relayout (the line's width)
-local saveBtn, searchField -- top bar pair: exactly one of them is visible
-local searchClear -- the field's clear icon (uikit.AttachClearButton)
-local editBtn, searchBtn -- top bar toggles, reset when the window closes
-local plusBtn -- "New category": hidden while categories are switched off
-local importBtn -- "Import a preset code": far right of the top-bar cluster
--- (the share + import windows live in ui/sharewin; this module owns when
--- they close, sharewin owns what they are)
-local searchQuery = "" -- live preset-name filter; "" = search inactive
+local dropLine
+local lastListW = 0
+local saveBtn, searchField -- exactly one of the two is visible
+local searchClear
+local editBtn, searchBtn
+local plusBtn
+local importBtn
+local searchQuery = ""
 
--- Case-insensitive name match. `*` is a wildcard; with no `*` the query is a
--- plain substring search, so typing "zuk" finds "Zuk melee" without ceremony.
--- The matcher itself is shared with the Core column (uikit.MatchesSearch).
 local function matchesSearch(name)
   return uikit.MatchesSearch(name, searchQuery)
 end
 
--- Edit and search are transient VIEW states, not preferences: closing the
--- window drops both, so it always reopens in the plain browse view.
 local function resetTransientModes()
   editMode = false
   searchQuery = ""
   pcall(function() editBtn:SetActive(false) end)
   pcall(function() searchBtn:SetActive(false) end)
-  pcall(function() searchField:SetText("") end) -- no callback: won't relayout
+  pcall(function() searchField:SetText("") end) -- SetText fires no onChange
   pcall(function() searchClear.SetVisible(false) end)
   pcall(function() searchField.root.hidden = true end)
   pcall(function() saveBtn.root.hidden = false end)
-  -- The import box belongs to the vault window that opened it. Left open it
-  -- would float with a stale code in it after the bank closed the vault.
   pcall(sharewin.CloseImport)
 end
-local drag = nil -- { slot } while a button drag is live
-local dragTick -- forward declaration: per-tick drag driver (drag section)
-local editHint -- "Drag items to rearrange" text, shown in edit mode
-local lockNotice -- why the vault is empty when a character can't be identified
-local emptyNotice -- two-line "No presets yet" hint on an empty, unlocked vault
+local drag = nil -- { slot } while a drag is live
+local dragTick
+local editHint
+local lockNotice
+local emptyNotice
 local userClosed = false
--- "Open vault window" pressed (settings or ribbon); the X clears it. In
--- memory only, so the window always starts hidden after a load.
 local wantOpen = false
-local layoutGuard = false -- suppress onToggle while relayout() syncs state
-local relayout -- forward declaration
+local layoutGuard = false -- true while relayout runs; callbacks must not re-enter
+local relayout
 
--- ---- time-based UI, driven by the uikit heartbeat ----------------------------
--- Tooltips and the drag ghost run off uikit's single Event.Logic
--- subscription; uikit.Now() is the timebase (~50 ticks/s).
 uikit.AddTicker("pvWindowDrag", function()
   if dragTick then dragTick() end
 end)
 
--- ---- drag plumbing -----------------------------------------------------------
 local function ensureGhost()
   if ghost then return ghost end
   ghost = prettyui.SimpleButton.new(host, "x", nil,
@@ -242,6 +191,7 @@ end
 
 -- Where a drop of `slot` would land, or nil when it would change nothing.
 -- A category: { cat, below, lineY }. A preset: { setCat, target, lineY }.
+-- lineY is in list content coords.
 local function resolveDrop(slot)
   local my = contentMouseY()
   if my == nil then return nil end
@@ -273,7 +223,7 @@ local function resolveDrop(slot)
   local catChange = not z.flat and (p.category or "") ~= z.cat
   local underHeader = z.headed and (z.y0 + ROW_H) or z.y0
   local gap = nil
-  if PersistentDB:GetBool("ui.lockAlpha") ~= true then
+  if prefs.GetBool("ui.lockAlpha") ~= true then
     gap = uikit.GapAt(z.rows, my)
   end
   if gap == nil then
@@ -306,7 +256,6 @@ local function applyDrop(slot, t)
   relayout()
 end
 
--- The 2px line marking where a drag would land.
 local function ensureDropLine()
   if dropLine then return dropLine end
   dropLine = ui.Rectangle.new(list.content)
@@ -318,8 +267,6 @@ local function ensureDropLine()
   return dropLine
 end
 
--- Scrolls the list a row at a time while a drag is held near its top or
--- bottom edge.
 local EDGE_PX, EDGE_TICKS = 16, 6
 local lastEdgeScroll = -100
 local function edgeScroll(m)
@@ -341,8 +288,6 @@ local function edgeScroll(m)
   end
 end
 
--- True when the mouse currently sits inside a slot's own band (content
--- coords) - the release-side "was this actually a click ON the thing" test.
 local function mouseOnSurf(slot)
   local my = contentMouseY()
   if my == nil then return false end
@@ -354,9 +299,8 @@ local function mouseOnSurf(slot)
     and my < (slot.surfY or 0) + (slot.surfH or 0)
 end
 
--- True while the pointer sits over one of the vault's own satellite windows
--- (icon picker, detail, share, import) - the edit-mode surfaces ignore the
--- press stream then.
+-- ONHOLD and ONRELEASE reach a drag surface by geometry, even when another
+-- plugin window overlaps it.
 local function mouseOverSatellite()
   local m = uikit.MousePos()
   if m == nil then return false end
@@ -377,31 +321,15 @@ local function mouseOverSatellite()
   return over(shareW) or over(importW)
 end
 
--- Hold-and-MOVE to drag. Each slot has an INVISIBLE drag surface
--- (ui.Layer) over its button, shown in edit mode only, which owns press
--- and hold there. Headers stay openable without leaving edit mode, but the
--- CLICK that toggles them is decided by US on ONRELEASE (press ends, no
--- drag started, cursor still on the banner) - native ONCLICK is ignored
--- entirely. Preset buttons get no click at all; in edit mode they are drag
--- handles. After any toggle, a stationary-cursor GRACE window stops the
--- shifted layout being grabbed or re-toggled by the same flurry of
--- presses.
---
--- A press ARMS a drag; it STARTS once the cursor travels DRAG_DEADZONE px
--- while held, so plain clicks stay clicks. On drag start the HELD surface
--- expands over the whole window, and the ghost follows Mouse.GetPosition
--- every Logic tick.
-local DRAG_DEADZONE = 6 -- px of travel while held before a drag starts
-local armed = nil -- { slot, x, y, tick }: press waiting to cross the deadzone
-local lastDragEnd = -10 -- uikit.Now() when the last drag finished (click suppression)
--- After a toggle the rows shift under the cursor. While the cursor stays
--- PARKED where it toggled, the drag surfaces neither arm a drag nor toggle
--- again - so the press that caused the shift cannot cascade onto whatever
--- slid into its place. Moving the cursor to aim ends the grace at once.
-local TOGGLE_GRACE_TICKS = 30 -- ~0.6s
+local DRAG_DEADZONE = 6 -- px
+local armed = nil -- { slot, x, y, tick }: a press that has not crossed the deadzone
+local lastDragEnd = -10
+-- After a toggle the rows shift under the pointer; while it stays parked
+-- there, surfaces neither arm nor toggle.
+local TOGGLE_GRACE_TICKS = 30
 local TOGGLE_GRACE_R2 = 144 -- 12px radius, squared
-local toggleGrace = -100 -- uikit.Now() of the last edit-mode toggle
-local togglePos = nil -- mouse position at that toggle
+local toggleGrace = -100
+local togglePos = nil
 local function inToggleGrace()
   if (uikit.Now() - toggleGrace) >= TOGGLE_GRACE_TICKS then return false end
   if togglePos == nil then return true end
@@ -410,9 +338,8 @@ local function inToggleGrace()
   local dx, dy = m.x - togglePos.x, m.y - togglePos.y
   return dx * dx + dy * dy < TOGGLE_GRACE_R2
 end
-local finishDrag -- forward declaration
+local finishDrag
 
--- restore a slot's drag surface to the geometry relayout gave it
 local function restoreSurf(slot)
   if not slot.dragSurf then return end
   slot.dragSurf:SetPos(slot.surfX or 0, slot.surfY or 0)
@@ -450,16 +377,15 @@ local function startDrag(slot)
   pcall(function() w = math.min(prettyui.SimpleButton.getSize(text), 220) end)
   g.root:SetSize(w, 26)
   g.root.hidden = false
-  -- expand the HELD surface over the whole list (capture trick)
+  -- Only the pressed surface keeps the hold stream and gets ONRELEASE, so it
+  -- is stretched over the list; a separate capture layer misses the release.
   slot.dragSurf:SetPos(0, 0)
   slot.dragSurf:SetSize(USABLE + SCROLLBAR_W, math.max(list.contentHeight or 0, WIN_H))
   pcall(function() slot.dragSurf:MoveToFront() end)
-  -- the line draws above the capture; it is click-through
   pcall(function() ensureDropLine():MoveToFront() end)
-  pcall(function() g.root:MoveToFront() end) -- ghost above the capture
+  pcall(function() g.root:MoveToFront() end)
 end
 
--- Per-tick while a drag is live; called from the pvWindowDrag ticker.
 dragTick = function()
   if not drag then return end
   local ok, err = pcall(function()
@@ -478,31 +404,27 @@ dragTick = function()
   if not ok then uikit.ReportOnce("drag tick", err) end
 end
 
--- Build + wire a slot's drag surface (parent = the list content). Reads
--- slot.dragText / slot.noDrag / slot.header / slot.preset at event time, so
--- one wiring serves whatever the pooled slot currently displays.
+-- The handlers read slot.dragText / noDrag / header / preset at event time,
+-- because slots are pooled.
 local function attachDrag(slot, parent)
   local surf = ui.Layer.new(parent)
   surf.clickthrough = false
   surf.hidden = true
   slot.dragSurf = surf
-  -- forward wheel events to the window scroll instead of swallowing them
+  -- without this the surface swallows the wheel
   pcall(function() surf:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", list._onScrollWheel) end)
 
   surf:Subscribe(ui.Hook.ONHOLD, function(c, hx, hy)
     local ok, err = pcall(function()
       if drag then return end
       uikit.CalibratePointer(c, hx, hy)
-      -- within the post-toggle grace the layout just moved: don't arm
       if inToggleGrace() then return end
-      -- a press inside an overlapping satellite window is not ours
       if mouseOverSatellite() then return end
       local m = uikit.MousePos()
       if not m then return end
-      -- ONHOLD streams roughly every tick while held; a LONG gap means the
-      -- previous press ended without ONRELEASE (cursor slid off the
-      -- surface) - treat this hold as a FRESH press or stale coords would
-      -- instant-drag it.
+      -- A gap over 10 ticks means the last press ended without ONRELEASE, so
+      -- this is a fresh press. A tighter tolerance re-anchors on every hitch
+      -- and the drag never starts.
       if not armed or armed.slot ~= slot or (uikit.Now() - (armed.tick or 0)) > 10 then
         armed = { slot = slot, x = m.x, y = m.y, tick = uikit.Now() }
         return
@@ -517,23 +439,19 @@ local function attachDrag(slot, parent)
     end)
     if not ok then log(formatStr("[PV] drag failed: {}", tostring(err))) end
   end)
-  -- The CLICK is decided here, on ONRELEASE - never from ui.Hook.ONCLICK.
-  -- A header toggles only when the press ends with NO drag started and the
-  -- cursor is still over the header's band. Preset slots have no
-  -- slot.header, so their release does nothing and their clicks die with
-  -- the surface.
+  -- The header click is decided here, never on ONCLICK, which appears to
+  -- fire at press time, before a drag can arm.
   local function onRelease()
     armed = nil
     if drag ~= nil then
       if drag.slot == slot then finishDrag(true) end
-      return -- a release during someone's drag is never a click
+      return
     end
     if slot.header == nil then return end
     local ok, err = pcall(function()
       if (uikit.Now() - lastDragEnd) < 2 then return end
       if inToggleGrace() then return end
       if not mouseOnSurf(slot) then return end
-      -- a release inside an overlapping satellite window is not a click here
       if mouseOverSatellite() then return end
       toggleGrace = uikit.Now()
       togglePos = uikit.MousePos()
@@ -544,16 +462,13 @@ local function attachDrag(slot, parent)
     if not ok then log(formatStr("[PV] header toggle failed: {}", tostring(err))) end
   end
   surf:Subscribe(ui.Hook.ONRELEASE, onRelease)
-  -- ONDRAGCOMPLETE gets a drag-only variant: if both events fire for one
-  -- release, the toggle must not run twice.
+  -- Drag-only: if this and ONRELEASE both fire, the toggle must not run twice.
   pcall(function()
     surf:Subscribe(ui.Hook.ONDRAGCOMPLETE, function()
       armed = nil
       if drag and drag.slot == slot then finishDrag(true) end
     end)
   end)
-  -- Hover forwarding: the surface sits over the slot's own hover target, so
-  -- the row look would otherwise go dead in edit mode.
   surf:Subscribe(ui.Hook.ONMOUSEOVER, function()
     if drag then return end
     if slot.header then pcall(function() slot.header:SetHovered(true) end)
@@ -565,10 +480,6 @@ local function attachDrag(slot, parent)
   end)
 end
 
--- ---- list pools ----------------------------------------------------------------
--- A preset row: zebra band with hover and selected fills, a gold border
--- while its bank view is live, optional icon and name. The band is a rect;
--- an invisible ui.Button over it takes the click and the hover.
 local function applyRowLook(s)
   pcall(function()
     local fill = s.base or ROW_ODD
@@ -582,7 +493,6 @@ local function applyRowLook(s)
   end)
 end
 
--- Preview cell look: gold while this row's preview is open, light on hover.
 local function applyViewLook(s)
   pcall(function()
     local open = s.preset ~= nil and selectedId == s.preset.id
@@ -605,7 +515,6 @@ local function ensureRowSlot(i)
   s.bg.fill = true
   s.bg.clickthrough = true
   s.bg.hidden = true
-  -- preview cell wash and hairline, under the selection border
   s.viewFill = ui.Rectangle.new(body)
   s.viewFill.fill = true
   s.viewFill.clickthrough = true
@@ -615,7 +524,6 @@ local function ensureRowSlot(i)
   s.viewDiv.rgba = VIEW_DIV_RGBA
   s.viewDiv.clickthrough = true
   s.viewDiv.hidden = true
-  -- the thin far-left strip uniting a category's rows with their header
   s.accent = ui.Rectangle.new(body)
   s.accent.fill = true
   s.accent.rgba = ACCENT_RGBA
@@ -641,14 +549,11 @@ local function ensureRowSlot(i)
   s.text.clickthrough = true
   s.text.hidden = true
 
-  -- hover state forwarded from the edit-mode drag surface overlaying the row
   s.setHovered = function(hov)
     s.hovered = hov == true
     applyRowLook(s)
   end
 
-  -- The invisible click target: toggles the bank preset view (the headline
-  -- act); the row stays visually active while this preset owns the bank.
   s.btn = ui.Button.new(body)
   s.btn.alpha = 0
   s.btn.text.content = ""
@@ -662,11 +567,9 @@ local function ensureRowSlot(i)
     return true
   end)
   s.btn:Subscribe(ui.Hook.ONCLICK, function()
-    -- Edit mode: the drag surface overlays the row, so this only fires for
-    -- clicks landing right of the surface's span - never toggle from there.
+    -- Load-bearing: the drag surface stops short of the row's buttons, so a
+    -- click in the gap lands here.
     if editMode then return end
-    -- Bank views only work on an open bank: block the click with an instant,
-    -- self-dismissing hint instead of letting Show() fail quietly.
     if not bankpage.IsBankOpen() then
       playSfx(BLOCKED_SFX)
       uikit.ShowInstantTip(s.btn, "Bank not in view", body,
@@ -675,9 +578,8 @@ local function ensureRowSlot(i)
     end
     local ok, err = pcall(function()
       if not s.preset then return end
-      -- With Core registered the row drives a Core view instead of
-      -- our panel engine. This is the ONLY place a view is opened, so the
-      -- two engines are mutually exclusive by routing.
+      -- The only place a view is opened, so the two engines are mutually
+      -- exclusive.
       if bankutil.IsActive() then
         if bankutil.ActivePresetId() == s.preset.id then
           bankutil.Hide()
@@ -687,11 +589,8 @@ local function ensureRowSlot(i)
           if shown then
             playRandomSfx(BANKVIEW_ON_SFX)
           elseif why == "not_all_items" then
-            -- same treatment as the panel engine's wrong-tab refusal
             bankpage.FlashWrongTab()
           else
-            -- bank_closed / preset_open / busy / failed: Core shows no
-            -- notice of its own, so chime + name the reason briefly
             playSfx(BLOCKED_SFX)
             uikit.ShowInstantTip(s.btn,
               why == "preset_open" and "Close the bank's preset panel first"
@@ -699,33 +598,29 @@ local function ensureRowSlot(i)
               body, uikit.TIP_BLOCKED_TICKS)
           end
         end
-        relayout() -- refresh the active highlight
+        relayout()
         return
       end
-      -- activePresetId alone decides the toggle.
+      -- Not IsApplied(): an empty preset moves no items, so its view could
+      -- never be turned off.
       if bankpage.activePresetId == s.preset.id then
         bankpage.Restore()
         playRandomSfx(BANKVIEW_OFF_SFX)
       else
-        -- Show plays its OWN refusal chime (wrong tab) - only chime the
-        -- click when it actually opened, or the two sounds overlap.
+        -- Show plays its own refusal sound
         if bankpage.Show(s.preset) ~= false then playRandomSfx(BANKVIEW_ON_SFX) end
       end
-      relayout() -- refresh the active highlight
+      relayout()
     end)
     if not ok then log(formatStr("[PV] bank toggle failed: {}", tostring(err))) end
   end)
-  -- forward wheel events to the window scroll instead of swallowing them
   pcall(function() s.btn:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", list._onScrollWheel) end)
-  -- hover: normal delayed tooltip only while the bank is open; with it closed
-  -- the hover shows nothing - the "Bank not in view" hint is click-only
   attachDelayedTooltip(s.btn, function()
     if not bankpage.IsBankOpen() then return nil end
     return "Toggle this preset's bank view"
   end, body)
-  attachDrag(s, body) -- edit-mode drag surface, overlays the row
+  attachDrag(s, body)
 
-  -- Preview cell: toggles the preset's detail window.
   s.viewGlyph = ui.Sprite.new(body)
   s.viewGlyph:SetSize(VIEW_GLYPH_SIZE, VIEW_GLYPH_SIZE)
   s.viewGlyph.spriteID = VIEW_SPRITE
@@ -791,22 +686,19 @@ local function hideRowSlot(s)
   s.delBtn.root.hidden = true
 end
 
--- Category header: a flat row - zebra band when collapsed, soft gold with
--- the accent strip when expanded, hover lifting the fill either way, the
--- rotating chevron far right, and an optional category icon before the name.
 -- Call-compatible with prettyui.CollapseButton (.root, :SetText,
--- :SetExpanded), but SetExpanded here is SILENT - onToggle fires on user
+-- :SetExpanded), except that SetExpanded is silent: onToggle fires on user
 -- clicks only.
 local function makeSectionHeader(parent)
   local h = { expanded = true, hovered = false, base = ROW_ODD }
 
   h.root = ui.Layer.new(parent)
-  h.root:SetSize(100, ROW_H) -- relayout re-sizes per pass
+  h.root:SetSize(100, ROW_H)
   h.root.clickthrough = false
 
   h.bg = ui.Rectangle.new(h.root)
   h.bg.fill = true
-  h.bg:SetSize(0, ROW_H, 1.0) -- full root width; rows are a fixed height
+  h.bg:SetSize(0, ROW_H, 1.0)
   h.bg.clickthrough = true
   h.accent = ui.Rectangle.new(h.root)
   h.accent.fill = true
@@ -817,7 +709,7 @@ local function makeSectionHeader(parent)
 
   h.icon = ui.Sprite.new(h.root)
   h.icon:SetSize(24, 24)
-  h.icon:SetPos(4, 5) -- eye-tuned: a touch below centred
+  h.icon:SetPos(4, 5)
   h.icon.clickthrough = true
   h.icon.hidden = true
 
@@ -829,7 +721,7 @@ local function makeSectionHeader(parent)
   h.label.clickthrough = true
 
   h.arrow = ui.Sprite.new(h.root)
-  h.arrow:SetSize(ARROW_SIZE, ARROW_SIZE) -- square: rotation-pivot-proof
+  h.arrow:SetSize(ARROW_SIZE, ARROW_SIZE) -- must stay square: rotated art clips otherwise
   h.arrow.spriteID = ARROW_SPRITE
   h.arrow:SetPos(-ARROW_SIZE - ARROW_PAD,
     math.floor((ROW_H - ARROW_SIZE) / 2), 1.0)
@@ -852,14 +744,12 @@ local function makeSectionHeader(parent)
 
   function h.SetText(_, text) h.label.content = tostring(text or "") end
 
-  -- The category icon, or nil for none; the name shifts to hug the row's
-  -- left edge when there is no icon.
   function h.SetIcon(_, spriteId)
     local nameX = 6
     if spriteId ~= nil then
       h.icon.hidden = false
       pcall(function() h.icon.spriteID = spriteId end)
-      nameX = 32 -- 24px icon at x 4 + a small gap
+      nameX = 32
     else
       h.icon.hidden = true
     end
@@ -872,7 +762,6 @@ local function makeSectionHeader(parent)
     updateState()
   end
 
-  -- hover forwarded from the edit-mode drag surface overlaying this header
   function h.SetHovered(_, hov)
     h.hovered = hov == true
     updateState()
@@ -886,8 +775,9 @@ local function makeSectionHeader(parent)
     h.hovered = false
     updateState()
   end)
-  -- Edit mode ignores this: toggling belongs to the drag surface then.
   h.root:Subscribe(ui.Hook.ONCLICK, function()
+    -- Load-bearing: the drag surface decides the toggle in edit mode but
+    -- stops short of the buttons, so a click in the gap lands here.
     if editMode then return end
     local ok, err = pcall(function()
       h:SetExpanded(not h.expanded)
@@ -895,7 +785,6 @@ local function makeSectionHeader(parent)
     end)
     if not ok then log(formatStr("[PV] header toggle failed: {}", tostring(err))) end
   end)
-  -- forward wheel events to the window scroll instead of swallowing them
   pcall(function() h.root:Subscribe(ui.Hook.ONSCROLLWHEEL, "pvWheel", list._onScrollWheel) end)
 
   h:SetIcon(nil)
@@ -911,9 +800,7 @@ local function ensureHeaderSlot(i)
   headerPool[i] = s
 
   s.header = makeSectionHeader(body)
-  attachDrag(s, body) -- edit-mode drag surface, overlays the banner
-  -- onToggle fires on USER clicks only (programmatic SetExpanded is silent,
-  -- and layoutGuard covers relayout), so the chime can live here.
+  attachDrag(s, body)
   s.header.onToggle = function(_, expanded)
     if layoutGuard then return end
     playSfx(CATEGORY_TOGGLE_SFX)
@@ -934,8 +821,6 @@ local function ensureHeaderSlot(i)
   setButtonSprites(s.renameBtn, 20983, 20984)
   attachDelayedTooltip(s.renameBtn.root, "Rename category", body)
 
-  -- Opens the icon picker for this category; same sprite as the detail
-  -- window's icon button.
   s.iconBtn = prettyui.SpriteButton.new(body, "SWAP", function()
     playSfx(CLICK_SFX)
     local ok, err = pcall(function()
@@ -953,7 +838,7 @@ local function ensureHeaderSlot(i)
     playSfx(CLICK_SFX)
     local ok, err = pcall(function()
       if not s.cat then return end
-      store.DeleteCategory(s.cat) -- presets fall back to Uncategorised
+      store.DeleteCategory(s.cat)
       if editingCat == s.cat then editingCat = nil end
       relayout()
     end)
@@ -974,9 +859,6 @@ local function hideHeaderSlot(s)
   s.delBtn.root.hidden = true
 end
 
--- Card separators: pooled 1px lines (see CARD_SEP_RGBA). MoveToFront on
--- every placement: a pooled separator can be OLDER than a header bg the
--- pool grew later, and siblings render in creation order.
 local function ensureSep(i)
   local sp = sepPool[i]
   if sp then return sp end
@@ -988,8 +870,6 @@ local function ensureSep(i)
   return sp
 end
 
--- The drag hint of an empty category: a full row in the
--- zebra flow - band, accent strip and the muted text.
 local function ensureHint(i)
   local hint = hintPool[i]
   if hint then return hint end
@@ -1028,7 +908,7 @@ local function ensureRenamePair()
       if old then
         local newName = store.CleanName(renameField:GetText())
         if newName ~= "" and newName ~= old then
-          setCollapsed(newName, isCollapsed(old)) -- carry this session's state
+          setCollapsed(newName, isCollapsed(old))
           store.RenameCategory(old, newName)
         end
       end
@@ -1039,7 +919,7 @@ local function ensureRenamePair()
   commitRename = commit
   renameField = prettyui.TextField.new(body, {
     x = 0, y = 0,
-    width = USABLE - 62, -- room for OK on the right
+    width = USABLE - 62,
     height = 26,
     maxLength = 25,
     placeholder = "Category name",
@@ -1057,7 +937,6 @@ local function ensureRenamePair()
   renameOk.root.hidden = true
 end
 
--- ---- layout --------------------------------------------------------------------
 relayout = function()
   if not win then return end
   layoutGuard = true
@@ -1067,10 +946,9 @@ relayout = function()
   renameField.root.hidden = true
   renameOk.root.hidden = true
 
-  -- Group presets by category: Uncategorised pinned first, then stored order.
   local groups, order = {}, {}
   groups[UNCAT] = {}
-  local catIcons = {} -- header icons by name, read off the same records
+  local catIcons = {}
   for _, c in ipairs(store.Categories()) do
     if groups[c.name] == nil then
       order[#order + 1] = c.name
@@ -1089,14 +967,11 @@ relayout = function()
       groups[cat][#groups[cat] + 1] = p
     end
   end
-  -- Uncategorised hides entirely when empty - except in edit mode, where it
-  -- must stay visible as the drop target that CLEARS a preset's category.
-  -- (Named categories always show, even empty.)
+  -- Edit mode keeps an empty Uncategorised: it is the drop target that
+  -- clears a preset's category.
   if #groups[UNCAT] > 0 or editMode then
     table.insert(order, 1, UNCAT)
   end
-  -- While searching, drop sections with no matches: a bare header over
-  -- nothing is noise, and so is the empty-category drag hint.
   if filtering then
     local kept = {}
     for _, cat in ipairs(order) do
@@ -1105,9 +980,8 @@ relayout = function()
     order = kept
   end
 
-  -- Categories off: one undivided list. Category DATA is untouched - we
-  -- only stop grouping by it - so switching back on restores every bucket.
-  local flatMode = PersistentDB:GetBool("ui.noCategories") == true
+  -- Flattened before the sort, so both views share the one stored order.
+  local flatMode = prefs.GetBool("ui.noCategories") == true
   if flatMode then
     local all = {}
     for _, cat in ipairs(order) do
@@ -1115,19 +989,16 @@ relayout = function()
     end
     groups, order = { [FLAT] = all }, { FLAT }
   end
-  if plusBtn then plusBtn.root.hidden = flatMode end -- nothing to add it to
-  -- Import slides left when "+" is hidden.
+  if plusBtn then plusBtn.root.hidden = flatMode end
   if importBtn then
     pcall(function()
       importBtn.root:SetPos(
         topBtnX(flatMode and TOP_SLOT_PLUS or TOP_SLOT_IMPORT), TOP_Y)
     end)
   end
-  -- Within a category: the user's manual arrangement, unless "Lock preset
-  -- order alphabetically" is on - which IGNORES the stored order rather
-  -- than destroying it, so unticking brings the arrangement back.
+  -- lockAlpha ignores the stored order; it never rewrites it.
   local orderIdx = nil
-  if PersistentDB:GetBool("ui.lockAlpha") ~= true then
+  if prefs.GetBool("ui.lockAlpha") ~= true then
     orderIdx = store.PresetOrderIndex()
   end
   dragOrderIdx = orderIdx or {}
@@ -1145,13 +1016,9 @@ relayout = function()
     end)
   end
 
-  -- Edit-mode banner: dragging lives on the buttons themselves now (no
-  -- visible handles), so edit mode announces it, centred under the top bar.
   if editHint == nil then
     editHint = ui.Text.new(win.content)
-    editHint:SetPos(0, LIST_Y - 10) -- snug under the top bar
-    -- same span as the Save button, so the text centres WITH Save rather
-    -- than with the whole window
+    editHint:SetPos(0, LIST_Y - 10)
     editHint:SetSize(USABLE - TOP_BTNS_W, 16)
     editHint.font = id.Font.MUSEO_SANS_15PT_REGULAR
     editHint.rgba = 0xB8A169CC
@@ -1159,12 +1026,8 @@ relayout = function()
     editHint.content = "Drag items to rearrange"
     editHint.clickthrough = true
   end
-  -- Per-character vaults: while the character's identity is unknown there is
-  -- no vault to open, and store.All() is deliberately empty. Say why, rather
-  -- than rendering what looks like a vault that has lost all its presets.
+  -- A locked vault reads as empty by design; the notice says why.
   local lockState = store.Locked() and store.IdentityState() or nil
-  -- One Text per line (see lockLines), centred on the window's full usable
-  -- width - the lines start below the top button row, so nothing collides.
   if lockNotice == nil then
     lockNotice = {}
     for i = 1, NOTICE_LINES do
@@ -1172,7 +1035,7 @@ relayout = function()
       t:SetPos(0, LIST_Y - 10 + (i - 1) * 19)
       t:SetSize(USABLE, 16)
       t.font = id.Font.MUSEO_SANS_15PT_REGULAR
-      t.rgba = (i == 1) and 0xE0B050FF or 0xB8A169CC -- reason gold, hint muted
+      t.rgba = (i == 1) and 0xE0B050FF or 0xB8A169CC
       t.alignHorizontal = ui.AlignMode.CENTRE
       t.clickthrough = true
       lockNotice[i] = t
@@ -1185,9 +1048,6 @@ relayout = function()
   end
   editHint.hidden = not editMode or lockState ~= nil
 
-  -- Two-line empty-vault hint, mirroring the BankUtil column's. Visibility
-  -- is decided AFTER the layout loop (needs to know nothing rendered); the
-  -- components are just built here, hidden, beside the lock notice.
   if emptyNotice == nil then
     emptyNotice = {}
     for i = 1, 2 do
@@ -1203,14 +1063,13 @@ relayout = function()
     end
   end
 
-  -- Row width is decided BEFORE layout: count the rows this pass will
-  -- show, and stop them short of the scrollbar lane only when the list
-  -- will actually overflow into a scrollbar.
+  -- This count must mirror the layout loop below exactly, or rows clip under
+  -- the scrollbar or leave an empty lane for one that is not there.
   local totalRows = 0
   for _, cat in ipairs(order) do
     local isFlat = (cat == FLAT)
     local freeStanding = isFlat or (cat == UNCAT
-      and PersistentDB:GetBool("ui.noUncatBucket") == true)
+      and prefs.GetBool("ui.noUncatBucket") == true)
     local collapsed = (not filtering) and isCollapsed(cat)
     if freeStanding then collapsed = false end
     if not freeStanding then totalRows = totalRows + 1 end
@@ -1225,7 +1084,6 @@ relayout = function()
   if viewH == nil or viewH <= 1 then
     viewH = (win.root.height or WIN_H) - TITLE_H - BORDER
   end
-  -- The list fills the window below the top bar and scrolls on its own.
   local listH = math.max(1, viewH - listTop)
   list.root:SetPos(0, listTop)
   list:SetSize(USABLE + SCROLLBAR_W, listH)
@@ -1236,9 +1094,6 @@ relayout = function()
   lastListW = listW
   local y = 0
   local hIdx, rIdx, tIdx, sIdx = 0, 0, 0, 0
-  -- ONE continuous zebra from top to bottom - headers count in the
-  -- alternation like any other row, and nothing leaves gaps. The list
-  -- should read as one cohesive, connected surface.
   local band = 0
   local prevExpandedCard = false
 
@@ -1247,22 +1102,15 @@ relayout = function()
     local isFlat = (cat == FLAT)
     local zoneStart = y
     local zoneRows = {}
-    -- Searching force-expands: a match hidden inside a collapsed section
-    -- would look like no result at all. The session collapse state is read
-    -- past, not written, so sections snap back when the search clears.
+    -- Searching force-expands without writing the collapse state.
     local collapsed = (not filtering) and isCollapsed(cat)
-    -- Free-standing rows: no header, never collapsible. Used both by "No
-    -- Uncategorised section" and by flat mode. The drop zone still covers
-    -- the rows, and the edit-mode hint still marks it when empty.
     local freeStanding = isFlat
-      or (isUncat and PersistentDB:GetBool("ui.noUncatBucket") == true)
+      or (isUncat and prefs.GetBool("ui.noUncatBucket") == true)
     if freeStanding then collapsed = false end
 
     if freeStanding then
       -- no header row at all
     else
-      -- The previous card ended here: a 1px line marks the boundary, or two
-      -- expanded sections back to back would merge their accent strips.
       if prevExpandedCard then
         sIdx = sIdx + 1
         local sp = ensureSep(sIdx)
@@ -1272,7 +1120,7 @@ relayout = function()
         pcall(function() sp:MoveToFront() end)
       end
       if editingCat == cat then
-        band = band + 1 -- the rename row keeps its place in the alternation
+        band = band + 1
         renameField.root:SetPos(0, y + 2)
         renameField:SetText(cat)
         renameField.root.hidden = false
@@ -1283,29 +1131,26 @@ relayout = function()
         local s = ensureHeaderSlot(hIdx)
         s.cat = cat
         s.dragText = cat
-        s.noDrag = isUncat -- Uncategorised is pinned first, never reorderable
+        s.noDrag = isUncat
         band = band + 1
         s.header.base = (band % 2 == 1) and ROW_ODD or ROW_EVEN
         s.header.root.hidden = false
         s.header.root:SetPos(0, y)
         s.header.root:SetSize(listW, ROW_H)
         s.surfX, s.surfY = 0, y
-        s.surfW, s.surfH = listW - 88, ROW_H -- clear of the button cluster
+        s.surfW, s.surfH = listW - 88, ROW_H
         s.dragSurf.hidden = not editMode
         if editMode then restoreSurf(s) end
         s.header:SetText(cat)
         s.header:SetIcon(catIcons[cat])
-        -- the chevron's corner belongs to the pencil and bin while editing
         s.header.arrow.hidden = editMode
         s.header:SetExpanded(not collapsed)
         s.renameBtn.root.hidden = isUncat or not editMode
         s.iconBtn.root.hidden = isUncat or not editMode
         s.delBtn.root.hidden = isUncat or not editMode
         if not s.renameBtn.root.hidden then
-          -- rename, icon, then - after a wider misclick buffer - the bin,
-          -- whose slot matches the rows' so the right column still aligns
-          s.renameBtn.root:SetPos(listW - 84, y + 6) -- pencil art reads 1px high
-          s.iconBtn.root:SetPos(listW - 60, y + 3) -- 24px: pulled back 2 to centre
+          s.renameBtn.root:SetPos(listW - 84, y + 6)
+          s.iconBtn.root:SetPos(listW - 60, y + 3)
           s.delBtn.root:SetPos(listW - 26, y + 5)
         end
       end
@@ -1323,8 +1168,6 @@ relayout = function()
         s.bg.hidden = false
         s.bg:SetPos(0, y)
         s.bg:SetSize(listW, ROW_H)
-        -- the strip only unites HEADED sections with their header; flat
-        -- mode and free-standing Uncategorised rows go without
         s.accent.hidden = freeStanding
         if not freeStanding then
           s.accent:SetPos(0, y)
@@ -1332,26 +1175,20 @@ relayout = function()
         end
         s.border:SetPos(0, y)
         s.border:SetSize(listW, ROW_H)
-        -- Rows under a header take an extra indent, icon included.
         local indent = freeStanding and 0 or CAT_INDENT
         local nameX = 10 + indent
         if p.icon then
           s.icon.hidden = false
-          -- 24px icon in a 30px row: x pulled to 4 so a 2px gap stays
-          -- before the name at 30, y 3 keeps it centred
           s.icon:SetPos(4 + indent, y + 3)
           pcall(function() s.icon.spriteID = p.icon end)
           nameX = 35 + indent
         else
           s.icon.hidden = true
-          -- Align no-icon names: iconless rows take the same indent as
-          -- icon'd ones, so every name lines up.
-          if PersistentDB:GetBool("ui.alignNamesOff") ~= true then
+          if prefs.GetBool("ui.alignNamesOff") ~= true then
             nameX = 35 + indent
           end
         end
 
-        -- Right-side reserve: the preview cell, plus the bin in edit mode.
         local reserve = editMode and (VIEW_CELL_W + 28) or VIEW_CELL_W
         s.text.hidden = false
         s.text:SetPos(nameX, y)
@@ -1359,18 +1196,16 @@ relayout = function()
         s.text.content = p.name
         s.btn.hidden = false
         s.btn:SetPos(0, y)
-        s.btn:SetSize(listW - reserve, ROW_H) -- clear of the buttons
+        s.btn:SetSize(listW - reserve, ROW_H)
         s.surfX, s.surfY = 0, y
         s.surfW, s.surfH = listW - reserve, ROW_H
         s.dragSurf.hidden = not editMode
         if editMode then restoreSurf(s) end
-        -- whichever engine owns the bank view supplies the highlight
         s.active = (bankutil.IsActive()
           and bankutil.ActivePresetId()
           or bankpage.activePresetId) == p.id
         applyRowLook(s)
 
-        -- preview cell: wash and glyph right of the hairline
         local cellX = listW - VIEW_CELL_W
         s.viewDiv.hidden = false
         s.viewDiv:SetPos(cellX, y + VIEW_DIV_INSET)
@@ -1385,13 +1220,11 @@ relayout = function()
         s.viewBtn:SetPos(cellX, y)
         s.viewBtn:SetSize(VIEW_CELL_W, ROW_H)
         applyViewLook(s)
-        -- edit mode: the bin sits just left of the hairline
         s.delBtn.root.hidden = not editMode
         if editMode then s.delBtn.root:SetPos(cellX - 24, y + 5) end
         zoneRows[#zoneRows + 1] = { id = p.id, y0 = y, y1 = y + ROW_H }
         y = y + ROW_H
       end
-      -- Empty categories always show the hint; flat mode never does.
       if #groups[cat] == 0 and not isFlat then
         tIdx = tIdx + 1
         local t = ensureHint(tIdx)
@@ -1410,9 +1243,8 @@ relayout = function()
         y = y + ROW_H
       end
     end
-    -- `flat` marks the zone as reorder-only: with categories switched off a
-    -- drop must not rewrite the preset's stored category, or toggling the
-    -- setting back on would find the buckets quietly emptied.
+    -- A flat zone is reorder-only: a drop there must never rewrite the
+    -- preset's stored category.
     dropZones[#dropZones + 1] = {
       cat = isUncat and "" or cat, y0 = zoneStart, y1 = y, flat = isFlat,
       headed = not freeStanding, rows = zoneRows,
@@ -1424,14 +1256,11 @@ relayout = function()
   for i = hIdx + 1, #headerPool do hideHeaderSlot(headerPool[i]) end
   for i = tIdx + 1, #hintPool do hideHint(hintPool[i]) end
   for i = sIdx + 1, #sepPool do sepPool[i].hidden = true end
-  -- Re-front the shown separators AFTER the layout loop: on a pool-growing
-  -- pass a separator can be older than a header bg created later, and
-  -- siblings render in creation order.
+  -- Siblings render in creation order, and a pooled separator can be older
+  -- than a header created on this pass.
   for i = 1, sIdx do pcall(function() sepPool[i]:MoveToFront() end) end
 
-  -- Empty-vault hint: nothing rendered at all (no rows, no category
-  -- headers), vault not locked, not mid-search. Matches the column's rule -
-  -- empty categories still count as "shown", so this is a truly empty vault.
+  -- An empty category still renders a header, so it does not count as empty.
   local showEmpty = rIdx == 0 and hIdx == 0 and lockState == nil and not filtering
   local eLines = showEmpty and { "No presets yet", "Press Save Preset" } or {}
   for i = 1, 2 do
@@ -1441,25 +1270,16 @@ relayout = function()
 
   pcall(function() list:SetContentHeight(y + 8) end)
   layoutGuard = false
-  -- The BankUtil sidebar column mirrors this list. One hook at the end of
-  -- every relayout covers every mutation that redraws the window (saves,
-  -- renames, deletes, drags, imports, collapse, identity changes).
   if M.OnListChanged then pcall(M.OnListChanged) end
 end
 
--- Bank-page view changes that originate outside this window's own buttons
--- (tab redirect, bank close, internal rebuilds) refresh the row states here
--- - e.g. the active banner un-toggles when a deposit force-switches tabs.
 bankpage.OnViewChanged = function()
   if win and not layoutGuard then pcall(relayout) end
 end
--- The Core-backed view dies outside our buttons too (native tab click,
--- another plugin's page, bank close) - same refresh, via Core's callbacks.
 bankutil.OnViewChanged = bankpage.OnViewChanged
 
--- ---- window lifecycle ------------------------------------------------------------
 M.Destroy = function()
-  if editingCat and commitRename then pcall(commitRename) end -- keep typed rename
+  if editingCat and commitRename then pcall(commitRename) end
   cancelDrag()
   hideTip()
   layoutGuard = true
@@ -1499,35 +1319,29 @@ local function buildWindow(parent, x, y)
       width = WIN_W, height = WIN_H,
       minWidth = WIN_W, minHeight = 220,
       scrollable = false,
+      -- Runs for the X and for a programmatic Close alike.
       onClose = function()
-        -- Mid-rename close (X or bank closing): keep whatever was typed.
         if editingCat and commitRename then pcall(commitRename) end
         userClosed = true -- stay hidden until the bank closes
-        wantOpen = false -- an opened-on-demand window is dismissed by its X
-        -- closing the vault also cancels any active preset bank view, so the
-        -- bank unlocks without hunting for the preset's own B button
-        -- (both calls no-op when no view is active; only one can ever be)
+        wantOpen = false
         pcall(bankpage.Restore)
         pcall(bankutil.Hide)
         detailwin.Hide()
-        -- Fires for BOTH the X and a programmatic win:Close() (bank closing),
-        -- so this is the single place transient view state is dropped.
         resetTransientModes()
       end,
     })
     centreTitle(win)
-    -- Tooltips with no explicit parent land in this window's content.
     uikit.SetDefaultTipParent(win.content)
-    -- The preset list scrolls inside its own view; the top bar stays fixed.
+    -- The window itself must not scroll. List items are children of
+    -- list.content, in list-local coords, and pass it as their tooltip parent.
     list = prettyui.SimpleView.new(win.content, {
       x = 0, y = LIST_Y,
       width = USABLE + SCROLLBAR_W,
       height = WIN_H - TITLE_H - BORDER - LIST_Y,
       scrollable = true, scrollStep = ROW_H,
     })
-    -- Hand each satellite module what it needs of ours (one-directional:
-    -- none of them require pvwin back, or the cycle would hand one side a
-    -- half-initialised module).
+    -- One-directional: a satellite that requires pvwin back gets a
+    -- half-initialised module from the cycle.
     sharewin.Configure({
       host = host,
       relayout = function() pcall(relayout) end,
@@ -1544,16 +1358,13 @@ local function buildWindow(parent, x, y)
     detailwin.Configure({
       host = host,
       relayout = function() pcall(relayout) end,
-      -- the detail window opens parked against the vault window's right edge
       anchor = function()
         if win then return win.root.x + win.root.width + 6, win.root.y end
       end,
-      -- fires on the detail window's X and any programmatic Close
       onClosed = function()
         selectedId = nil
         if not layoutGuard then pcall(relayout) end
       end,
-      -- a rename in the detail window updates the visible row label in place
       renameRow = function(id, name)
         for _, s in ipairs(rowPool) do
           if s.preset and s.preset.id == id and not s.text.hidden then
@@ -1565,12 +1376,8 @@ local function buildWindow(parent, x, y)
       end,
     })
 
-    -- Centred between the left border and the top-right cluster; the
-    -- search field reuses saveX/saveW so it lands in the button's exact
-    -- footprint.
-    --
-    -- The LABEL is fitted to the button, longest-that-fits, because the
-    -- button cannot be fitted to the label.
+    -- FancyButton is text-sized and options.width is only a minimum, so the
+    -- label is fitted to the space.
     local saveAvail = USABLE - TOP_BTNS_W - TOP_BTN_GAP
     local saveLabel, saveW
     for _, candidate in ipairs({ "Save Preset", "Save" }) do
@@ -1579,30 +1386,21 @@ local function buildWindow(parent, x, y)
       if saveW <= saveAvail then break end
     end
     local saveX = math.max(0, math.floor((saveAvail - saveW) / 2))
-    -- The behaviour lives in M.SaveCurrentGear (shared with the BankUtil
-    -- sidebar column, which has its own Save button).
     saveBtn = prettyui.FancyButton.new(win.content, saveLabel, function()
       M.SaveCurrentGear()
     end, { x = saveX, y = TOP_Y, variant = "positive" })
-    -- Spells out what a shortened label drops. Always attached, so the text
-    -- is the same whichever label the fit loop picked.
     attachDelayedTooltip(saveBtn.root,
       "Save your current gear and backpack as a new preset")
 
-    -- Search field occupies the Save button's exact slot - same x, same width.
-    -- The two are never shown together. Built once (component budget), hidden
-    -- until search is on.
     searchField = prettyui.TextField.new(win.content, {
       x = saveX, y = TOP_Y,
       width = saveW,
       height = 26,
       maxLength = 25,
       placeholder = "Search...",
-      -- Wider right margin so the text scrolls before it reaches the
-      -- clear icon parked in the field's right edge.
       contentMargin = ui.Margin.new(8, 3, 26, 0),
       onChange = function(f)
-        -- Read the field, NOT the callback's content arg.
+        -- the callback's content argument is unreliable; read the field
         searchQuery = f:GetText() or ""
         pcall(function() searchClear.SetVisible(searchQuery ~= "") end)
         pcall(relayout)
@@ -1610,10 +1408,9 @@ local function buildWindow(parent, x, y)
       _onScrollWheel = list._onScrollWheel,
     })
     searchField.root.hidden = true
-    -- Clear icon inside the field's right edge; wipes the query in place.
     searchClear = uikit.AttachClearButton(win.content, function()
       searchQuery = ""
-      pcall(function() searchField:SetText("") end) -- no callback: hide by hand
+      pcall(function() searchField:SetText("") end) -- SetText fires no onChange
       searchClear.SetVisible(false)
       pcall(relayout)
     end)
@@ -1624,16 +1421,13 @@ local function buildWindow(parent, x, y)
         playSfx(CLICK_SFX)
         local okC, errC = pcall(function()
           local name = store.AddCategory()
-          editingCat = name -- open the fresh bucket straight in rename mode
+          editingCat = name
           relayout()
         end)
         if not okC then log(formatStr("[PV] new category failed: {}", tostring(errC))) end
       end, { x = topBtnX(TOP_SLOT_PLUS), y = TOP_Y, size = TOP_BTN, iconSize = 14 })
     attachDelayedTooltip(plusBtn.root, "New category")
 
-    -- Edit-mode toggle: one mode for all editing - shows/hides the rename +
-    -- delete buttons and enables hold-and-move dragging. In-memory only:
-    -- the local survives in-place rebuilds; closing the window drops it.
     editBtn = prettyui.SimpleButton.new(win.content,
       prettyui.Sprites.SPRITE_BUTTONS.PENCIL.neutral, function(_, active)
         playSfx(CLICK_SFX)
@@ -1647,8 +1441,6 @@ local function buildWindow(parent, x, y)
         toggleable = true, active = editMode,
       })
 
-    -- Search toggle, rightmost. Swaps Save for the search field; turning it
-    -- off clears the query so the list is never left silently filtered.
     searchBtn = prettyui.SimpleButton.new(win.content, 25230,
       function(_, active)
         playSfx(CLICK_SFX)
@@ -1658,8 +1450,6 @@ local function buildWindow(parent, x, y)
             searchQuery = ""
             pcall(function() searchField:SetText("") end)
           end
-          -- Both directions start with an empty query, so the clear icon
-          -- hides either way; typing brings it back.
           pcall(function() searchClear.SetVisible(false) end)
           searchField.root.hidden = not on
           saveBtn.root.hidden = on
@@ -1672,19 +1462,13 @@ local function buildWindow(parent, x, y)
       })
     attachDelayedTooltip(searchBtn.root, "Search presets")
 
-    -- Import: far right of the cluster. Opens a box to paste a share code
-    -- into; the decoded preset lands in this vault keeping its own name and
-    -- icon, in Uncategorised (codes carry no category - store.Import).
     importBtn = prettyui.SimpleButton.new(win.content, IMPORT_SPRITE, function()
       playSfx(CLICK_SFX)
       local okI, errI = pcall(sharewin.OpenImport)
       if not okI then log(formatStr("[PV] import open failed: {}", tostring(errI))) end
     end, { x = topBtnX(TOP_SLOT_IMPORT), y = TOP_Y, size = TOP_BTN,
-      -- 16, not the cluster's 14: the 29456 art reads small at 14, and
-      -- the BankUtil column draws the same icon at 16
       iconSize = 16 })
     attachDelayedTooltip(importBtn.root, "Import a preset from a share code")
-    -- no icon hover variant needed: the button backdrop has its own hover
     attachDelayedTooltip(editBtn.root,
       "Toggle edit mode (rename, delete, drag to reorder)")
 
@@ -1693,7 +1477,6 @@ local function buildWindow(parent, x, y)
   if not ok then log(formatStr("[PV] UI build failed: {}", tostring(err))) end
 end
 
--- The floating vault window in the game-world layer.
 local function rebuild()
   local gameArea = ui.Interfaces:GetComponent(id.Component.TOPLEVEL_V2__PLUGIN_BUILD_LAYER_TOP)
   if not gameArea then
@@ -1707,7 +1490,6 @@ M.EnsureBuilt = function()
   if win == nil then rebuild() end
 end
 
--- Show/hide with the bank. Respect a user X-close until the bank closes.
 M.SetHidden = function(hidden)
   if win == nil then return end
   if hidden then
@@ -1715,57 +1497,47 @@ M.SetHidden = function(hidden)
       pcall(function() win:Close() end)
       detailwin.Hide()
     end
+    -- Close ran onClose, which set userClosed
     userClosed = false
   elseif not userClosed then
     if win.root and win.root.hidden then
       pcall(function() win:Show() end)
-      pcall(relayout) -- bank-close resets any active bank view
+      pcall(relayout)
     end
   end
 end
 
--- Identity changed - login, logout, a permission grant or revoke, or the ID
--- finally arriving. The vault may now resolve to a different key, or to
--- none at all, so the list is redrawn.
 M.OnIdentityChanged = function()
   if win then pcall(relayout) end
 end
 
--- Relayouts if the window is up, and notifies the column either way.
+-- While integrated the window is never built, and the column still has to
+-- be told: relayout calls M.OnListChanged only when there is a window.
 M.Relayout = function()
   if win then
-    pcall(relayout) -- fires M.OnListChanged at its end
+    pcall(relayout)
   elseif M.OnListChanged then
     pcall(M.OnListChanged)
   end
 end
 
--- The current vault is no longer the one on screen (multi-character toggled,
--- the shared-vault picker switched, or a vault was reset): drop everything
--- that referenced it. The caller restores the bank view (bankpage.Restore)
--- itself - this is only the window side.
+-- Window side only: the caller restores the bank view itself.
 M.OnVaultChanged = function()
   pcall(detailwin.Hide)
   selectedId = nil
   editingCat = nil
   editMode = false
   if win then
-    pcall(relayout) -- fires M.OnListChanged at its end
+    pcall(relayout)
   elseif M.OnListChanged then
-    -- the BankUtil column can be up with this window never built
     pcall(M.OnListChanged)
   end
 end
 
--- "Open vault window" button (settings + ribbon): FORCE the window open
--- regardless of bank state - never closes it (dismiss via the window's own
--- X). Auto mode honours wantOpen until the bank next closes (main.lua
--- clears it then); manual mode honours it until the X.
 M.ForceOpen = function()
-  -- Refuses while integrated, with the BLOCKED chime.
   if bankutil.HasColumn() then
     playSfx(BLOCKED_SFX)
-    log("[PV] BankUtils Integration is on - presets live in the bank's sidebar")
+    log("[PV] Bank Core Integration is on - presets live in the bank's sidebar")
     return
   end
   wantOpen = true
@@ -1774,16 +1546,11 @@ M.ForceOpen = function()
   M.SetHidden(false)
 end
 
--- main.lua's visibility rule reads this each pass; the X and (in auto
--- mode) a bank close clear it.
 M.WantOpen = function() return wantOpen end
 M.ClearWantOpen = function() wantOpen = false end
 
--- ---- BankUtil column bridge -------------------------------------------------
--- The sidebar column reuses this window's behaviour rather than duplicating
--- it, through these exports. List changes flow back out via
--- M.OnListChanged, assigned by bucolumn and fired at relayout's end.
-
+-- Assigned by ui/bucolumn, which requires this module; requiring it back
+-- from here would be a cycle.
 M.OnListChanged = nil
 M.UNCAT = UNCAT
 M.IsCollapsed = isCollapsed
@@ -1791,35 +1558,29 @@ M.SetCollapsed = setCollapsed
 M.LockLines = lockLines
 M.NOTICE_LINES = NOTICE_LINES
 
--- The Save button's behaviour, callable from the column. Plays its own
--- confirm/refusal sounds; returns true when a preset was stored.
+-- Plays its own sounds; returns true when a preset was stored.
 M.SaveCurrentGear = function()
   local saved = false
   local okS, errS = pcall(function()
     local cap = snapshot.Capture()
-    -- Both refusals are silent to the eye - the list just doesn't change -
-    -- so they get the same BLOCKED chime the bank page uses for a wrong-tab
-    -- refusal. Without it a locked vault reads as a dead button.
     if not cap then
       playSfx(BLOCKED_SFX)
       log("[PV] could not read gear/backpack")
       return
     end
     local p = store.Add(cap)
-    if p == nil then -- vault locked: no identified character to save under
+    if p == nil then -- the vault is locked
       playSfx(BLOCKED_SFX)
       log("[PV] cannot save - character not identified")
       return
     end
     log(formatStr("[PV] preset saved ({} worn, {} inv)", #p.equipment, #p.backpack))
-    -- New presets land in Uncategorised; if that section is collapsed the
-    -- save would be invisible (sound only). Expand it so the change shows.
-    -- (Free-standing mode has no section and is always visible.)
+    -- the new preset lands in Uncategorised, which may be collapsed
     setCollapsed(UNCAT, false)
     if win then
-      pcall(relayout) -- fires M.OnListChanged for the column
+      pcall(relayout)
     elseif M.OnListChanged then
-      pcall(M.OnListChanged) -- saved from the column, window never built
+      pcall(M.OnListChanged)
     end
     playSfx(SAVE_SFX)
     saved = true
@@ -1828,9 +1589,8 @@ M.SaveCurrentGear = function()
   return saved
 end
 
--- Builds the window host on demand for the satellites that parent to it
--- (detail window, icon picker, share and import windows), and immediately
--- re-hides a FRESHLY built one.
+-- Hides a freshly built window at once: hiding it later would close the
+-- satellite being opened along with it.
 local function ensureHost()
   local wasBuilt = win ~= nil
   M.EnsureBuilt()
@@ -1839,7 +1599,6 @@ local function ensureHost()
   return true
 end
 
--- The row preview cell's behaviour: open or close a preset's detail window.
 M.ToggleDetail = function(preset)
   if preset == nil then return end
   if not ensureHost() then return end
@@ -1857,8 +1616,8 @@ M.ToggleDetail = function(preset)
   if not ok then log(formatStr("[PV] preview failed: {}", tostring(err))) end
 end
 
--- Column-facing openers: the window-owned satellites the column's
--- right-click actions summon.
+-- The satellites only work once buildWindow has configured them, hence
+-- ensureHost in each opener below.
 M.OpenIconPicker = function(preset)
   if preset == nil then return end
   if not ensureHost() then return end
@@ -1888,8 +1647,6 @@ M.OpenImport = function()
   sharewin.OpenImport()
 end
 
--- The bank-view toggle sounds and the category accordion, exported so the
--- column's clicks sound identical to the window's.
 M.PlayBankViewSfx = function(on)
   playRandomSfx(on and BANKVIEW_ON_SFX or BANKVIEW_OFF_SFX)
 end

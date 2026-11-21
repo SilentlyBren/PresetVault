@@ -1,53 +1,56 @@
--- Preset persistence, and the vault-selection layer that decides WHICH
--- stored vault is the current one.
---
--- STORAGE LAYOUT - a small index plus ONE KEY PER PRESET. PersistentDB
--- discards any value at or above 131,072 bytes, so the split keeps every
--- stored value bounded by a single preset's contents rather than letting one
--- blob grow with the whole vault. A vault is therefore not one key:
---
---   vault.v1.<scope>.idx     { nextId, categories = {{name, icon?}, ...},
---                              order = { presetId, ... },   -- manual arrangement
---                              ids   = { presetId, ... } }  -- what exists
---   vault.v1.<scope>.p<id>   { id, name, category?, icon?,
---                              equipment = {entry...}, backpack = {entry...},
---                              bob? = { size, items = {entry...} } }
---                              entry = { slot, obj, count, name }
---
--- `<scope>` is "base" for the original vault, or the character's tracking
--- ID. Which scope is read depends on the Multi-character setting:
---   off (default) : one shared vault, `vault.sharedScope`, default "base".
---   on            : one vault per character. The claiming character keeps
---                   "base"; everyone else gets their tracking ID.
---
--- Vault data is NEVER copied or moved between scopes - toggling the setting
--- only changes which scope is read.
---
+-- Preset persistence, and the vault-selection layer that decides which
+-- stored vault is the current one. One PersistentDB key per preset plus a
+-- small index per vault.
 local identity = require("core/identity")
 
 local M = {}
 
-local PREFIX = "vault.v1"            -- all vault data lives under this
-local SCOPE_BASE = "base"            -- the original vault; also character 1's
-local KEY_SHARED = "vault.sharedScope" -- which scope shared mode reads
-local KEY_OWNER = "vault.baseOwner"  -- tracking ID that claimed SCOPE_BASE
-local KEY_LABELS = "vault.labels"    -- { [scope] = displayName } for the UI
-local MAX_NAME = 25 -- UI input fields enforce this too; clamp here as backstop
+local PREFIX = "vault.v1"
+local SCOPE_BASE = "base"
+local KEY_SHARED = "vault.sharedScope"
+local KEY_OWNER = "vault.baseOwner"
+local KEY_LABELS = "vault.labels"
+local MAX_NAME = 25
 
-local lastScope = nil -- avoids rewriting the label table on every single read
+local lastScope = nil
 
--- Removes markup tags and angle brackets from a name, then clamps its length.
+-- { scope, idx, presets = { [id] = preset, or false when the key is absent } }
+local cache = nil
+
+-- false marks an unset key
+local strings = {}
+
+local function getStr(key)
+  local v = strings[key]
+  if v == nil then
+    v = PersistentDB:GetString(key) or false
+    strings[key] = v
+  end
+  return v or nil
+end
+
+local function setStr(key, value)
+  PersistentDB:SetString(key, value)
+  strings[key] = nil
+end
+
+M.Invalidate = function()
+  cache = nil
+  strings = {}
+end
+
+-- Label text is markup, and an invalid image tag crashes the client when drawn.
 M.CleanName = function(s)
   s = tostring(s or ""):gsub("<[^<>]*>", ""):gsub("[<>]", "")
   return string.sub(s, 1, MAX_NAME)
 end
 
-local MAX_ICON = 0x7FFFFFFF -- the share format's icon ceiling
+local MAX_ICON = 0x7FFFFFFF
 
 -- Sprite ids that crash the client when drawn.
 local UNSAFE_ICONS = { [1243] = true }
 
--- Returns the icon as a whole sprite id, or nil when it must not be drawn.
+-- Returns nil when the icon must not be drawn.
 M.CleanIcon = function(iconId)
   local n = tonumber(iconId)
   if n == nil or n ~= math.floor(n) or n < 0 or n > MAX_ICON then return nil end
@@ -59,39 +62,27 @@ end
 local function idxKey(scope) return PREFIX .. "." .. scope .. ".idx" end
 local function presetKey(scope, id) return PREFIX .. "." .. scope .. ".p" .. id end
 
--- ===========================================================================
--- Verified writes
--- ===========================================================================
-
--- Writes a table and proves it landed. PersistentDB discards a value at or
--- above 131,072 bytes and still reports success, so a write that did nothing
--- is otherwise indistinguishable from one that worked. `rev` is bumped on
--- every write and compared on read-back: a structural check would not do,
--- since a rejected write leaves the PREVIOUS value in place and a rename
--- changes no counts.
+-- PersistentDB silently drops a value of 131,072 bytes or more and reports
+-- success, so every write is read back. `rev` is what gets compared, because
+-- a rejected write leaves the previous value in place.
 local function writeVerified(key, tbl)
   tbl.rev = (tbl.rev or 0) + 1
   PersistentDB:SetStructuredData(key, tbl)
   local back = PersistentDB:GetStructuredData(key)
   if back ~= nil and back.rev == tbl.rev then return true end
+  cache = nil -- the in-memory copy holds an edit that never landed
   log(formatStr("[PV] SAVE FAILED for {} - value rejected (128 KiB ceiling?)",
     tostring(key)))
   return false
 end
 
--- ===========================================================================
--- Scope selection
--- ===========================================================================
-
--- Records the current character's display name against its scope, so the
--- vault picker can read "Zezima (12 presets)" instead of a 64-bit number.
--- Per-character mode only.
+-- Per-character mode only: a shared scope would be relabelled by every
+-- character that reads it.
 local function rememberLabel(scope)
   if scope == lastScope then return end
   if not identity.Enabled() then return end
   local name = identity.DisplayName()
-  -- Bail before latching lastScope if the name is not readable yet, so a
-  -- later attempt still gets the chance to record it.
+  -- lastScope is latched only after a name has been read
   if name == nil then return end
   lastScope = scope
   local labels = PersistentDB:GetStructuredData(KEY_LABELS) or {}
@@ -100,26 +91,21 @@ local function rememberLabel(scope)
   PersistentDB:SetStructuredData(KEY_LABELS, labels)
 end
 
--- The scope the vault currently reads and writes, or nil when locked.
+-- nil means the vault is locked; callers must not substitute a default.
 local function scope()
   if not identity.Enabled() then
-    local s = PersistentDB:GetString(KEY_SHARED)
+    local s = getStr(KEY_SHARED)
     if s == nil or s == "" then s = SCOPE_BASE end
     return s
   end
   local id = identity.Get()
   if id == nil then return nil end
-  -- An unclaimed base vault LOCKS; ownership is only ever claimed by
-  -- M.ClaimBaseVault, when the user turns Multi-character on.
-  local owner = PersistentDB:GetString(KEY_OWNER)
+  -- an unclaimed base vault locks; only M.ClaimBaseVault assigns an owner
+  local owner = getStr(KEY_OWNER)
   if owner == nil or owner == "" then return nil end
   if owner == id then return SCOPE_BASE end
   return id
 end
-
--- ===========================================================================
--- Index and preset I/O
--- ===========================================================================
 
 local function readIndex(s)
   local idx = PersistentDB:GetStructuredData(idxKey(s))
@@ -130,22 +116,32 @@ local function readIndex(s)
   return idx
 end
 
--- The current vault's index, or nil when locked. Also the one place that
--- refreshes the display label, so it sits on every read path.
+local function cacheFor(s)
+  if cache == nil or cache.scope ~= s then
+    cache = { scope = s, idx = readIndex(s), presets = {} }
+  end
+  return cache
+end
+
+-- Returns the index and its scope, or nil when locked.
 local function loadIndex()
   local s = scope()
   if s == nil then return nil end
   rememberLabel(s)
-  return readIndex(s), s
+  return cacheFor(s).idx, s
 end
 
 local function readPreset(s, id)
-  return PersistentDB:GetStructuredData(presetKey(s, id))
+  local c = cacheFor(s)
+  local p = c.presets[id]
+  if p == nil then
+    p = PersistentDB:GetStructuredData(presetKey(s, id)) or false
+    c.presets[id] = p
+  end
+  return p or nil
 end
 
--- Every preset in the vault, in `ids` order. The only full fan-out read -
--- and the UI wants all of them whenever it calls this, so there is nothing
--- to save by being lazier.
+-- An id in `ids` with no preset key is skipped, not treated as an error.
 local function loadAll()
   local idx, s = loadIndex()
   if idx == nil then return nil, nil, nil end
@@ -157,22 +153,13 @@ local function loadAll()
   return out, idx, s
 end
 
--- ===========================================================================
--- Ordering
--- ===========================================================================
-
--- Alphabetical preset order with an id tie-break - the sort every list
--- falls back to when a preset has no manual position.
 M.NameOrder = function(a, b)
   local an, bn = string.lower(a.name or ""), string.lower(b.name or "")
   if an ~= bn then return an < bn end
   return a.id < b.id
 end
 
--- Resolves the vault's manual arrangement into a clean id list: stored
--- order first, then anything missing appended alphabetically, with ids of
--- deleted presets dropped. Needs the presets themselves for the
--- alphabetical tail, hence the argument.
+-- A preset absent from idx.order sorts by name, after the ordered ones.
 local function resolveOrder(idx, presets)
   local known, out, seen = {}, {}, {}
   for _, p in ipairs(presets) do known[p.id] = true end
@@ -191,7 +178,7 @@ local function resolveOrder(idx, presets)
   return out
 end
 
--- Position lookup for sorting: { [presetId] = index }.
+-- { [presetId] = position }. The resolved order is not saved.
 M.PresetOrderIndex = function()
   local presets, idx = loadAll()
   if presets == nil then return {} end
@@ -200,12 +187,8 @@ M.PresetOrderIndex = function()
   return index
 end
 
--- Drops `movedId` onto `targetId`: dragging DOWN lands after the target,
--- dragging UP lands before it. A nil target goes to the end.
---
--- Both indices are read BEFORE the removal, which is what preserves the
--- direction: removing `from` shifts a later target down one, so "after the
--- target" and "before the target" both collapse to `target`.
+-- Dragging down lands after the target, up lands before it; nil goes last.
+-- Both indices must be read before the removal to keep that direction.
 M.ReorderPreset = function(movedId, targetId)
   if movedId == targetId then return end
   local presets, idx, s = loadAll()
@@ -223,76 +206,63 @@ M.ReorderPreset = function(movedId, targetId)
   writeVerified(idxKey(s), idx)
 end
 
--- ===========================================================================
--- Lock state and ownership
--- ===========================================================================
-
--- True while per-character mode is waiting on, or has failed to get, an
--- identity.
 M.Locked = function()
   return scope() == nil
 end
 
--- identity.State, plus the one condition only the store can see:
--- "unclaimed" - identified fine, but nobody owns the base vault.
+-- identity.State(), plus "unclaimed": identified, but the base vault has no
+-- owner.
 M.IdentityState = function()
   local state = identity.State()
   if state ~= "ready" then return state end
-  local owner = PersistentDB:GetString(KEY_OWNER)
+  local owner = getStr(KEY_OWNER)
   if owner == nil or owner == "" then return "unclaimed" end
   return "ready"
 end
 
--- Binds the existing vault to the current character. Returns false when the
--- character cannot be identified, in which case the caller MUST NOT enable
--- the setting. An existing owner is never overwritten.
+-- Returns false when the character has no id; the caller must then not
+-- enable per-character mode. An existing owner is never overwritten.
 M.ClaimBaseVault = function()
   local id = identity.Get()
   if id == nil then return false end
-  local owner = PersistentDB:GetString(KEY_OWNER)
+  local owner = getStr(KEY_OWNER)
   if owner == nil or owner == "" then
-    PersistentDB:SetString(KEY_OWNER, id)
+    setStr(KEY_OWNER, id)
   end
-  lastScope = nil -- the scope is about to change; relabel on the next read
+  lastScope = nil
   return true
 end
 
--- An opaque token identifying the current vault, for comparison against
--- M.Vaults()[i].key. Only ui/settings uses it, for the shared-vault picker.
+-- An opaque token, compared against M.Vaults()[i].key.
 M.CurrentKey = scope
 
--- ===========================================================================
--- Presets
--- ===========================================================================
-
+-- The cached records themselves; callers must not edit them.
 M.All = function()
   local presets = loadAll()
   return presets or {}
 end
 
--- Appends a preset record and registers it in the index. Two small writes
--- (the preset, then the index) instead of rewriting the whole vault.
+-- The preset is written before the index: an orphan key is harmless, a
+-- registered id with no data is not.
 local function addPreset(p)
   local idx, s = loadIndex()
   if idx == nil then return nil end
   p.id = idx.nextId
   idx.nextId = idx.nextId + 1
   if not writeVerified(presetKey(s, p.id), p) then return nil end
+  cacheFor(s).presets[p.id] = p
   idx.ids[#idx.ids + 1] = p.id
   writeVerified(idxKey(s), idx)
   return p
 end
 
--- Stores a fresh snapshot capture under a new id and default name.
+-- Returns nil when the vault is locked or the write is rejected.
 M.Add = function(capture)
   capture.name = "New Preset"
   return addPreset(capture)
 end
 
--- Stores a preset decoded from someone else's share code, keeping the
--- sender's name and icon. Always lands in Uncategorised - share codes
--- carry no category. Returns the stored preset, or nil when the vault is
--- locked.
+-- Returns nil when the vault is locked or the write is rejected.
 M.Import = function(preset)
   if type(preset) ~= "table" then return nil end
   local name = M.CleanName(preset.name)
@@ -322,15 +292,13 @@ M.Delete = function(presetId)
       break
     end
   end
-  -- Index first here: a surviving preset key whose id is deregistered is
-  -- invisible, whereas a deleted key still listed in `ids` would be a gap
-  -- loadAll has to skip on every read.
+  -- Index first: a deregistered preset key is invisible, an id still listed
+  -- with no key is a gap every read has to skip.
   writeVerified(idxKey(s), idx)
   PersistentDB:Delete(presetKey(s, presetId))
+  if cache ~= nil and cache.scope == s then cache.presets[presetId] = false end
 end
 
--- Mutates one preset in place: read its key, apply `fn`, write it back.
--- The index is not touched, so these are the cheapest writes in the module.
 local function editPreset(presetId, fn)
   local s = scope()
   if s == nil then return end
@@ -346,7 +314,7 @@ M.SetCategory = function(presetId, category)
   end)
 end
 
--- Sets the sprite id shown beside the preset's name; nil clears it.
+-- A nil iconId clears the icon.
 M.SetIcon = function(presetId, iconId)
   iconId = M.CleanIcon(iconId)
   editPreset(presetId, function(p) p.icon = iconId end)
@@ -358,18 +326,14 @@ M.Rename = function(presetId, newName)
   editPreset(presetId, function(p) p.name = name end)
 end
 
--- ===========================================================================
--- Categories (index only, except where preset.category must follow)
--- ===========================================================================
-
--- The category records ({name, icon?}), in display order.
+-- The cached { name, icon? } array in display order; callers must not edit it.
 M.Categories = function()
   local idx = loadIndex()
   if idx == nil then return {} end
   return idx.categories
 end
 
--- Sets the sprite id shown on the category's header; nil clears it.
+-- A nil iconId clears the icon.
 M.SetCategoryIcon = function(name, iconId)
   local idx, s = loadIndex()
   if idx == nil then return end
@@ -382,9 +346,8 @@ M.SetCategoryIcon = function(name, iconId)
   writeVerified(idxKey(s), idx)
 end
 
--- Drops `name` onto `targetName`: dragging DOWN lands after the target,
--- dragging UP lands before it. A blank or unknown target means first - a
--- drop on the pinned Uncategorised section.
+-- Same direction rule as M.ReorderPreset; a blank or unknown target means
+-- first.
 M.ReorderCategory = function(name, targetName)
   if name == targetName then return end
   local idx, s = loadIndex()
@@ -400,35 +363,25 @@ M.ReorderCategory = function(name, targetName)
   writeVerified(idxKey(s), idx)
 end
 
--- Moves `name` to sit directly above or below `targetName` - the explicit
--- form menu-driven reordering needs, where there is no drag direction to
--- infer from.
+-- Both positions are resolved before the array is touched: an unknown target
+-- must leave the cached index unedited.
 M.MoveCategory = function(name, targetName, below)
   if name == targetName then return end
   local idx, s = loadIndex()
   if idx == nil then return end
-  local from
+  local from, to
   for i, c in ipairs(idx.categories) do
-    if c.name == name then
-      from = i
-      break
-    end
+    if from == nil and c.name == name then from = i end
+    if to == nil and c.name == targetName then to = i end
   end
-  if from == nil then return end
+  if from == nil or to == nil then return end
   local rec = table.remove(idx.categories, from)
-  local to = nil
-  for i, c in ipairs(idx.categories) do
-    if c.name == targetName then
-      to = i
-      break
-    end
-  end
-  if to == nil then return end -- unknown target: the local copy is discarded
+  if from < to then to = to - 1 end -- the removal shifted the target up one
   table.insert(idx.categories, below and (to + 1) or to, rec)
   writeVerified(idxKey(s), idx)
 end
 
--- Creates an empty category with a unique placeholder name and returns it.
+-- Returns the new category's name, or nil when locked.
 M.AddCategory = function()
   local idx, s = loadIndex()
   if idx == nil then return nil end
@@ -444,7 +397,6 @@ M.AddCategory = function()
   return name
 end
 
--- Removes the category; its presets fall back to Uncategorised.
 M.DeleteCategory = function(name)
   local presets, idx, s = loadAll()
   if presets == nil then return end
@@ -463,9 +415,8 @@ M.DeleteCategory = function(name)
   end
 end
 
--- Renames a category across the stored list and every preset using it.
--- Renaming onto an existing category MERGES into it: the target record
--- survives, adopting the source's icon only when it has none of its own.
+-- Renaming onto an existing category merges into it; the target takes the
+-- source's icon only when it has none.
 M.RenameCategory = function(old, new)
   if new == nil then return end
   new = M.CleanName(new)
@@ -493,11 +444,7 @@ M.RenameCategory = function(old, new)
   end
 end
 
--- ===========================================================================
--- Vault management (settings panel)
--- ===========================================================================
-
--- Every vault that holds data, as { key, label, count }, label-sorted.
+-- { key, label, count } for every vault that holds data, sorted by label.
 M.Vaults = function()
   local labels = PersistentDB:GetStructuredData(KEY_LABELS) or {}
   local seen, out = {}, {}
@@ -518,19 +465,17 @@ M.Vaults = function()
   return out
 end
 
--- Picks which vault shared mode reads. Moves no data, so the others stay
--- dormant and intact.
 M.SetSharedVault = function(key)
   if key == nil or key == "" then return end
-  PersistentDB:SetString(KEY_SHARED, key)
+  setStr(KEY_SHARED, key)
   lastScope = nil
 end
 
--- Wipes the vault in use - this character's, or the shared one. Other
--- characters' vaults and all settings survive.
+-- Returns false when locked.
 M.ResetCurrentVault = function()
   local s = scope()
   if s == nil then return false end
+  -- the id list must be read before the index is deleted
   local idx = readIndex(s)
   for _, id in ipairs(idx.ids) do
     PersistentDB:Delete(presetKey(s, id))
@@ -542,6 +487,7 @@ M.ResetCurrentVault = function()
     PersistentDB:SetStructuredData(KEY_LABELS, labels)
   end
   lastScope = nil
+  cache = nil
   return true
 end
 

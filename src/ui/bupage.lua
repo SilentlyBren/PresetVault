@@ -1,52 +1,34 @@
--- The BankUtil Core bank-view engine: draws the preset into Core's custom
--- view, as a STATELESS rebuild of the shared model (core/presetview).
---
--- Core destroys and redraws the entire drawing on every bank item change,
--- and handles what the standalone engine has to fight for: masking the
--- natives, moving the real bank stack under whichever bound cell the
--- pointer hovers, and repairing its own layout. Only three pieces of live
--- machinery survive between redraws, because Core cannot do them for us:
---   * the top-up satisfaction refresh - badges and dims mutated in place
---   * the one-click left-click default, flagged via opConfig on the stack
---     Core has parked under a cell
---   * pending-click accounting from Event.MiniMenuEntrySelected
---
--- main.lua injects { draw = M.Draw, stop = M.Stop } into
--- bankutil.SetViewProvider. M.Stop runs whenever the view stops being ours.
+-- The Bank Core bank-view engine: draws the preset into Core's custom view
+-- as a stateless rebuild of the shared model (core/presetview), and runs
+-- the live layer (badges, one-click flags, pending clicks) between redraws.
 local M = {}
+local prefs = require("core/prefs")
 
 local P = require("core/presetview")
 local invread = require("core/invread")
 local uikit = require("ui/uikit")
 local bankutil = require("core/bankutil")
 
-local BANK_INV_STATIC = 201 -- the 1920-slot grid: where Core's moved stacks live
+local BANK_INV_STATIC = 201 -- the bank's item grid, where Core's moved stacks live
 
 local SHORTFALL_FONT, SHORTFALL_FONT_H = uikit.SmallFont()
 
--- ---- module state (survives redraws; a drawing's components do not) ----------
-local drawing = nil -- { model, bySrc } for the CURRENT Core drawing
-local counts = {} -- inv 95 totals, refreshed by the live layer
+local drawing = nil -- { model, bySrc } for the current Core drawing
+local counts = {} -- inv 95 totals
 local carried = {} -- inv 93 + 94 + 530 totals
--- Unconfirmed clicks: srcObj -> { amount, tick, snap, bySect }, where `snap`
--- is the snapshot obj served (it differs from the key for noted items) and
--- `bySect` splits the amount across the sections clicked.
+-- srcObj -> { amount, tick, snap, bySect }. `snap` is the snapshot obj, which
+-- differs from the key for noted items; `bySect` splits amount by section.
 local pending = {}
 local tickCount = 0
 local forceTicks = 0
 local running = false
--- The opConfig flags we own right now: child -> { op, map, cell }.
-local flags = {}
--- The last child-and-cell pairing a flag served, kept briefly after the
--- flag dies so a MENU pick (whose pointer is on the menu, not the cell)
--- can still direct its pending booking at the right section.
+local flags = {} -- child -> { op, map, cell, origQty, origMode }
+-- The last parked pairing, kept after its flag dies: a menu pick arrives
+-- with the pointer on the menu, not the cell.
 local recent = nil -- { child, cell, tick }
-local RECENT_TTL = 150 -- ticks (~3s): longer than any realistic menu dwell
--- Per-unit cells the player has withdrawn FROM, per srcObj, keyed by each
--- cell's ordinal within its group (stable across redraws): the next
--- binding puts the placeholders under exactly these cells, so the cell
--- the player clicked is the one that dims. Survives redraws and view
--- toggles; cleared when the preset changes.
+local RECENT_TTL = 150 -- ticks
+-- Per-unit cell ordinals the player has withdrawn from. Survives redraws
+-- and view toggles; cleared when the preset changes.
 local consumed = {} -- srcObj -> { list = {ord..}, set = {[ord]=true} }
 local lastPresetId = nil
 
@@ -54,8 +36,7 @@ local nameOf = uikit.ObjName
 
 local carriedCounts = invread.Carried
 
--- Bank read for the model: per obj, native stack count + total units.
--- Core's GetBankItems first, inv 95 slots as the fallback.
+-- Core's read lists placeholders at quantity 0; the inv 95 fallback may not.
 local function readBank()
   local bank, totals = {}, {}
   local function add(obj, q)
@@ -82,15 +63,15 @@ local function readBank()
   return bank, totals
 end
 
--- ---- one-click flags ----------------------------------------------------------
 local function unflagChild(child, entry)
   pcall(function()
     if entry.op ~= nil then
       child.opConfig:SetOpIDHighPriority(entry.op, false)
     end
   end)
-  -- Hand the native quantity back: the LIVE bank total for a single-stack
-  -- obj, the park-time reading otherwise. Skipped if we never stamped.
+  -- Core never restores quantity. A stacked cell gets the live bank total
+  -- (the park-time reading is stale after a withdrawal); never-stamped
+  -- children are left alone.
   if (entry.origQty or 0) >= 1 then
     pcall(function()
       local q = entry.origQty
@@ -120,19 +101,17 @@ local function cellRemaining(c)
   return P.CellRemaining(drawing.model, c, carried, pending)
 end
 
--- Finds the stack Core has parked under our hovered cell and keeps its
--- left-click default flagged to that cell's current need. A grid child is
--- parked at a cell when its object id resolves to that cell, its
--- on-screen position overlaps the cell's sprite, AND the pointer is
--- inside the cell - Core only ever parks under the pointer, so a match
--- without the pointer is a home-position coincidence, never a park.
--- How far a grid child's on-screen position may sit from a cell's sprite
--- and still count as parked there.
-local PARK_TOLERANCE = 8
+local PARK_TOLERANCE = 8 -- px between a parked child and its cell's sprite
+local function spriteXY(c)
+  return c.sprite.xyGlobal
+end
+-- A grid child is parked at a cell when its obj resolves to that cell, it
+-- overlaps the cell's sprite, and the pointer is inside the cell. The
+-- pointer test is required: a stack's home position can overlap a cell.
 local function stepFlags()
   local model = drawing and drawing.model
   if model == nil then return end
-  -- EXACT layout: get out of Core's way and let it own input natively.
+  -- flags and stamps would block Core's per-occurrence stack-follow
   if model.exact then
     unflagAll()
     return
@@ -142,11 +121,29 @@ local function stepFlags()
     unflagAll()
     return
   end
-  -- No pointer reading means no way to tell a park from a coincidence:
-  -- hold no flags at all (native defaults still work) rather than risk one.
   local mouse = nil
   pcall(function() mouse = uikit.MousePos() end)
   if mouse == nil then
+    unflagAll()
+    return
+  end
+  -- Skips the grid walk when the pointer is in no cell. The bounds must
+  -- stay identical to the park test below.
+  local overCell = false
+  for _, c in ipairs(model.cells) do
+    if c.sprite ~= nil and c.srcObj ~= nil then
+      local ok, sg = pcall(spriteXY, c)
+      if ok and sg ~= nil
+        and mouse.x >= sg.x - PARK_TOLERANCE
+        and mouse.x < sg.x + 36 + PARK_TOLERANCE
+        and mouse.y >= sg.y - PARK_TOLERANCE
+        and mouse.y < sg.y + 32 + PARK_TOLERANCE then
+        overCell = true
+        break
+      end
+    end
+  end
+  if not overCell then
     unflagAll()
     return
   end
@@ -163,8 +160,6 @@ local function stepFlags()
           if c.sprite ~= nil then
             local sg = nil
             pcall(function() sg = c.sprite.xyGlobal end)
-            -- cell sprites are 36x32; the pointer must be inside the cell
-            -- (with the park slack) for the child to count as parked there
             if sg ~= nil
               and mouse.x >= sg.x - PARK_TOLERANCE
               and mouse.x < sg.x + 36 + PARK_TOLERANCE
@@ -180,22 +175,19 @@ local function stepFlags()
       end)
     end)
   end)
-  -- release flags on children no longer parked
   for child, entry in pairs(flags) do
     if seen[child] == nil then
       unflagChild(child, entry)
       flags[child] = nil
     end
   end
-  -- flag (or re-choose and re-assert) the parked ones; re-assert matters -
-  -- client re-layouts can drop op config, and a mutation costs nothing
+  -- re-asserted every tick: client re-layouts can drop op config
   for child, c in pairs(seen) do
     recent = { child = child, cell = c, tick = tickCount }
     local entry = flags[child]
     if entry == nil then
       entry = { map = scanOps(child), cell = c }
-      -- the native quantity, captured BEFORE the badge stamp below ever
-      -- touches this child - unflagChild hands it back
+      -- read before the stamp below ever touches this child
       pcall(function()
         entry.origQty = child.associatedObjectQuantity
         entry.origMode = child.associatedObjectQuantityMode
@@ -204,18 +196,12 @@ local function stepFlags()
     elseif entry.cell ~= c then
       entry.cell = c
     end
-    -- An inventory event can swap the parked child's op list IN PLACE (a
-    -- unique emptying into a placeholder while hovered - Core's light
-    -- hover path keeps the park); re-scan during the post-event window so
-    -- the cached map cannot flag a withdraw index against placeholder ops.
+    -- an inventory event can swap the parked child's op list in place
     if forceTicks > 0 then entry.map = scanOps(child) end
     local live = (c.srcObj ~= nil) and (counts[c.srcObj] or 0) or 0
     local want = P.ChooseOp(entry.map, cellRemaining(c), live,
       model.equipObjs[c.obj] == true, c.stacked)
-    -- This engine NEVER flags Examine. Core redraws and re-parks through
-    -- every withdrawal, so a flag that changed across those transitions
-    -- would churn the left-click label before settling. Native defaults
-    -- rule here; satisfied cells rely on the dim and the player.
+    -- Examine is never flagged: it churns the label across Core's re-parks
     if want ~= nil and want == entry.map.examine then want = nil end
     pcall(function()
       local oc = child.opConfig
@@ -225,9 +211,9 @@ local function stepFlags()
       entry.op = want
       if want ~= nil then oc:SetOpIDHighPriority(want, true) end
     end)
-    -- While parked, the child carries OUR badge rather than its true
-    -- quantity, re-stamped per tick. Two safety rules: never stamp a
-    -- placeholder (origQty < 1), and never stamp below 1.
+    -- Core reads this field and treats <= 0 as a placeholder: never stamp
+    -- a placeholder, never stamp below 1. The client rewrites it on a
+    -- withdrawal, hence the stamp every tick.
     if (entry.origQty or 0) >= 1 then
       pcall(function()
         local qty, always = c.lastRem, c.lastAlways == true
@@ -243,14 +229,11 @@ local function stepFlags()
   end
 end
 
--- ---- display ------------------------------------------------------------------
--- Badge and dim for one cell, mutated in place on OUR sprite.
 local function applyCellDisplay(c)
   if c.sprite == nil or drawing == nil then return end
   local banked = (c.srcObj ~= nil) and (drawing.model.claimQty[c.srcObj] or 0) or 0
   local rem, always, satisfied =
     P.Badge(c, cellRemaining(c), drawing.model.exact, banked)
-  -- remembered so stepFlags can stamp the parked child with the same badge
   c.lastRem, c.lastAlways = rem, always
   pcall(function()
     c.sprite.associatedObjectQuantity = rem
@@ -264,8 +247,8 @@ local function applyCellDisplay(c)
   end
 end
 
--- Marks cells whose Core backing must be a PLACEHOLDER, so satisfaction
--- dims them first (P.CellRemaining's claimGone ordering).
+-- Marks the cells Core backs with a placeholder. Assumes M.Draw's binding
+-- order (consumed ordinals last); the two must change together.
 local function markClaimGone()
   if drawing == nil then return end
   local groups = {}
@@ -277,7 +260,6 @@ local function markClaimGone()
         local g = groups[c.srcObj]
         g[#g + 1] = c
       else
-        -- plain non-stacked cells: model order, gone past the unit count
         occ[c.srcObj] = (occ[c.srcObj] or 0) + 1
         c.claimGone = occ[c.srcObj] > (counts[c.srcObj] or 0)
       end
@@ -320,10 +302,8 @@ local function updateDisplays()
   for _, c in ipairs(drawing.model.cells) do applyCellDisplay(c) end
 end
 
--- ---- live layer ---------------------------------------------------------------
--- Pending reconciles on the ARRIVAL side here, unlike the panel engine's
--- bank-drop side. Old-vs-fresh carried is compared in the SAME pass that
--- stores the fresh table.
+-- Pending reconciles as items arrive in carried, not as they leave the
+-- bank: Core redraws on the bank change while the item is still in flight.
 local function refreshCounts()
   local freshCarried = carriedCounts()
   P.ReconcileArrivals(pending, carried, freshCarried, tickCount)
@@ -331,27 +311,29 @@ local function refreshCounts()
   counts = invread.CountInv(95)
 end
 
-local function onTick()
-  pcall(function()
-    tickCount = tickCount + 1
-    if drawing == nil then return end
-    local structural = forceTicks > 0 or tickCount % 25 == 0
-    if forceTicks > 0 then forceTicks = forceTicks - 1 end
-    if structural then
-      if bankutil.ActivePresetId() == nil then
-        M.Stop()
-        return
-      end
-      -- Close the view when the player starts a native search or filter.
-      if bankutil.NativeSearchActive() then
-        pcall(bankutil.Hide)
-        return
-      end
-      refreshCounts()
-      updateDisplays()
+local function tickBody()
+  tickCount = tickCount + 1
+  if drawing == nil then return end
+  local structural = forceTicks > 0 or tickCount % 25 == 0
+  if forceTicks > 0 then forceTicks = forceTicks - 1 end
+  if structural then
+    -- a close that missed Stop must not leave flags on bank children
+    if bankutil.ActivePresetId() == nil then
+      M.Stop()
+      return
     end
-    stepFlags()
-  end)
+    if bankutil.NativeSearchActive() then
+      pcall(bankutil.Hide)
+      return
+    end
+    refreshCounts()
+    updateDisplays()
+  end
+  stepFlags()
+end
+
+local function onTick()
+  pcall(tickBody)
 end
 
 local function stop()
@@ -362,9 +344,8 @@ local function stop()
   pcall(function() Event.InventoryUpdated.Unsubscribe("pvBuInv") end)
 end
 
--- Books a click the moment the client dispatches it: the amount lands in
--- `pending`, displays re-dim, and the flagged op re-chooses inside the same
--- handler. Covers left clicks AND menu picks.
+-- Books left clicks and menu picks into `pending` as the client dispatches
+-- them, so a rapid second click sees the first.
 local function onMenuSelected(event)
   pcall(function()
     if drawing == nil then return end
@@ -376,7 +357,8 @@ local function onMenuSelected(event)
     if obj == nil then return end
     local cellsFor = drawing.bySrc[obj]
     if cellsFor == nil then return end
-    -- Only clicks on the bank's own components book a prediction.
+    -- backpack clicks on the same obj must not book: the refresh pass
+    -- already counts them
     local inBank = false
     pcall(function()
       local cur, depth = cd.component, 0
@@ -391,20 +373,19 @@ local function onMenuSelected(event)
     end)
     if not inBank then return end
     local amount = nil
-    local sect = "backpack" -- where a withdraw lands unless we know better
+    local sect = "backpack"
     local step = verb:match("^Withdraw%-(%d+)$")
     if step ~= nil then
       amount = tonumber(step)
     elseif verb == "Withdraw-All" then
       amount = counts[obj] or 0
     elseif verb:find("Wear") or verb:find("Wield") or verb:find("Equip") then
-      amount = 1 -- a wear consumes one unit; the NEXT click must already
-      -- see the cell satisfied (Examine), not wear a second copy
+      amount = 1
       sect = "equipment"
     end
-    if amount == nil or amount <= 0 then return end -- Examine/other
-    -- The clicked stack is the parked child we flagged, matched with ==,
-    -- and its CELL's section directs the prediction.
+    if amount == nil or amount <= 0 then return end
+    -- matched with ==: the event's component is fresh userdata, so it
+    -- cannot be used as a table key
     local cellHit = nil
     pcall(function()
       local clicked = cd.component
@@ -416,9 +397,7 @@ local function onMenuSelected(event)
           return
         end
       end
-      -- A MENU pick lands with the pointer on the menu, so the
-      -- pointer-gated flag is usually gone by then; the remembered
-      -- last-parked pairing directs it instead.
+      -- a menu pick arrives after the pointer-gated flag is gone
       if recent ~= nil and recent.child == clicked
         and (tickCount - (recent.tick or 0)) <= RECENT_TTL
         and recent.cell ~= nil then
@@ -426,10 +405,8 @@ local function onMenuSelected(event)
         cellHit = recent.cell
       end
     end)
-    -- A fast move-and-click can land BEFORE the tick that would have
-    -- flagged the parked pairing (the known <=1-tick gap), leaving both
-    -- lookups empty - resolve the cell by POSITION instead: the clicked
-    -- component sits parked AT its cell.
+    -- A click can land before the tick that flags the pairing; the clicked
+    -- component is parked at its cell, so position finds it.
     if cellHit == nil then
       pcall(function()
         local clicked = cd.component
@@ -449,9 +426,6 @@ local function onMenuSelected(event)
         end
       end)
     end
-    -- Clicked-cell dims: remember which per-unit cell this withdrawal
-    -- came from, so the next binding parks the placeholder under IT
-    -- (Draw binds consumed ordinals last; markClaimGone dims them).
     if cellHit ~= nil and cellHit.perUnit and cellHit.unitOrd ~= nil
       and cellHit.srcObj ~= nil then
       local marks = consumed[cellHit.srcObj]
@@ -464,9 +438,6 @@ local function onMenuSelected(event)
         marks.list[#marks.list + 1] = cellHit.unitOrd
       end
     end
-    -- `snap` is the snapshot obj this prediction serves, which differs
-    -- from the bank stack's obj for noted items. FoldPending and the
-    -- arrival reconcile both key on it.
     local p = pending[obj] or { amount = 0, snap = cellsFor[1].obj, bySect = {} }
     p.amount = (p.amount or 0) + amount
     p.bySect = p.bySect or {}
@@ -492,8 +463,7 @@ local function start()
       pcall(function()
         if ev.inv == nil then return end
         local iid = ev.inv.id
-        -- carried counts (93/94/530) change without touching the bank on
-        -- equip swaps and BoB transfers; 95 covers withdraw/deposit
+        -- 95 is the bank; 93, 94 and 530 are the carried inventories
         if iid == 95 or iid == 93 or iid == 94 or iid == 530 then
           forceTicks = 3
         end
@@ -502,9 +472,6 @@ local function start()
   end)
 end
 
--- ---- chrome -------------------------------------------------------------------
--- One canvas below the cell sprites: title, dividers, doll connectors and
--- ghosts, slot backdrops, missing and partial tints.
 local function drawChrome(cv, model, view)
   local w = math.max(P.CHROME_W, view.width or P.CHROME_W)
   local h = math.max(model.chromeH, view.height or 0)
@@ -514,19 +481,17 @@ local function drawChrome(cv, model, view)
     cv:AddText(P.ORIGIN_X - 2, y - 3, text, font, P.TITLE_COLOUR)
     cv:AddRectangle(P.ORIGIN_X, y + 18, P.GRID_W, 1, P.DIVIDER_COLOUR)
   end
-  -- page title: section-title text with no underline rule
   cv:AddText(P.ORIGIN_X - 2, P.TITLE_Y - 3, tostring(model.preset.name or ""),
     font, P.TITLE_COLOUR)
   divider(P.ORIGIN_Y, "Worn")
   divider(P.PACK_HEADER_Y, "Backpack")
   if model.bobHeaderY ~= nil then divider(model.bobHeaderY, "Beast of Burden") end
   local slotBg = prettyui.Sprites.ITEM_SLOT_BACKGROUND
-  -- the game's connector lines first, so slot art covers their ends
+  -- connectors first, so slot art covers their ends
   for _, c in ipairs(P.WORN_CONNECTORS) do
     cv:AddSprite(P.DOLL_CX + c[1], P.DOLL_Y + c[2], c[3], c[4], c[5],
       P.CONNECTOR_TINT)
   end
-  -- doll slots: same backdrop + art geometry as every other cell
   for slotIdx, m in pairs(P.WORN_BANK) do
     local p = P.WornPos(slotIdx)
     cv:AddSprite(p.x + P.SLOT_BG_DX, p.y + P.SLOT_BG_DY, P.BOX, P.BOX,
@@ -535,12 +500,9 @@ local function drawChrome(cv, model, view)
       cv:AddSprite(p.x, p.y, 32, 32, m[3], P.GHOST_TINT)
     end
   end
-  -- exact layout: empty slots keep their backdrop, so a gap in the
-  -- snapshot reads as a gap rather than the grid ending early
   for _, p in ipairs(model.emptyBg or {}) do
     cv:AddSprite(p.x, p.y, P.BOX, P.BOX, slotBg, P.WHITE)
   end
-  -- cell backdrops + missing/partial tints (doll backdrops drawn above)
   for _, c in ipairs(model.cells) do
     local bx, by, bs = c.x + P.SLOT_BG_DX, c.y + P.SLOT_BG_DY, P.BOX
     if not c.doll then cv:AddSprite(bx, by, bs, bs, slotBg, P.WHITE) end
@@ -552,8 +514,6 @@ local function drawChrome(cv, model, view)
   end
 end
 
--- Shortfall "-N" plates on a SECOND canvas, created after the cell sprites
--- so the text draws above the item art.
 local function drawLabels(cv, model, view)
   cv:SetSize(math.max(P.CHROME_W, view.width or P.CHROME_W),
     math.max(model.chromeH, view.height or 0))
@@ -564,23 +524,22 @@ local function drawLabels(cv, model, view)
       pcall(function()
         w = config.Font.FromID(SHORTFALL_FONT):GetStringWidth(txt, false) + 6
       end)
-      local lx, ly = c.x - 3, c.y + 20 -- bottom-left of the slot box
+      local lx, ly = c.x - 3, c.y + 20
       cv:AddRectangle(lx, ly, w, SHORTFALL_FONT_H + 2, 0x000000A6)
       cv:AddText(lx + 3, ly + 1, txt, SHORTFALL_FONT, P.SHORTFALL_COLOUR)
     end
   end
 end
 
--- ---- the drawer (Core calls this for every drawing) ---------------------------
--- Errors are deliberately NOT swallowed here.
+-- Core calls this for every drawing; returns the content height. Errors
+-- must propagate: Core then restores the native view. No handle methods
+-- may be called from here (they answer "busy").
 M.Draw = function(view)
-  -- stacks were restored before Core redraws, and the old drawing's
-  -- components are about to be destroyed with their layers
   unflagAll()
   drawing = nil
   local preset = bankutil.ViewPreset()
   if preset == nil then return 0 end
-  -- consumed marks belong to ONE preset's cell geometry
+  -- consumed marks belong to one preset's cell geometry
   if preset.id ~= lastPresetId then
     lastPresetId = preset.id
     consumed = {}
@@ -589,8 +548,8 @@ M.Draw = function(view)
   local bank, freshCounts = readBank()
   counts = freshCounts
   carried = carriedCounts()
-  local exact = PersistentDB:GetBool("ui.exactLayout") == true
-  -- Tints are built from carried PLUS in-flight clicks.
+  local exact = prefs.GetBool("ui.exactLayout") == true
+  -- pending is folded in: Core redraws before carried shows the withdrawal
   local model = P.Build(preset, bank, P.FoldPending(carried, pending),
     exact, nameOf)
 
@@ -599,20 +558,15 @@ M.Draw = function(view)
   canvas.clickthrough = true -- the pointer must reach Core's input beneath
   drawChrome(canvas, model, view)
 
-  -- One sprite per cell, badge-stamped, bound in allocation order
-  -- (equipment, backpack ascending, BoB). EVERY cell is bound, missing
-  -- ones included. Noted forms bind the RESOLVED id.
+  -- Core matches stacks in binding order, so cells bind in model order and
+  -- every cell is bound, missing ones included. Per-unit groups bind
+  -- consumed cells last; markClaimGone assumes that order.
   local bySrc = {}
-  -- Per-unit split groups bind NON-CONSUMED cells first, consumed cells
-  -- LAST: Core assigns stacks by occurrence over its stocked-first
-  -- grouping, so the placeholders land under exactly the cells the player
-  -- withdrew from - the clicked cell dims, matching the standalone
-  -- engine's sticky claims.
   local perUnitGroups = {}
   for _, c in ipairs(model.cells) do
     local s = ui.Sprite.new(view.parent)
     s:SetPos(c.x, c.y)
-    s:SetSize(36, 32) -- every cell, doll or grid, is the same size
+    s:SetSize(36, 32)
     s:SetAssociatedObject(c.obj)
     c.sprite = s
     c.dimmed = nil
@@ -621,7 +575,7 @@ M.Draw = function(view)
       if perUnitGroups[key] == nil then perUnitGroups[key] = {} end
       local g = perUnitGroups[key]
       g[#g + 1] = c
-      c.unitOrd = #g -- stable ordinal within the group, across redraws
+      c.unitOrd = #g -- stable across redraws
     else
       view:BindItem(s, c.srcObj or c.obj)
     end
@@ -642,28 +596,28 @@ M.Draw = function(view)
     end
   end
 
+  -- created after the sprites so the plates draw above the item art
   local labels = ui.Canvas.new(view.parent)
   labels:SetPos(0, 0)
   labels.clickthrough = true
   drawLabels(labels, model, view)
 
   drawing = { model = model, bySrc = bySrc }
-  updateDisplays() -- badges + dims against the counts just read
+  updateDisplays()
   start()
   return model.chromeH
 end
 
--- The view stopped being ours - close, bank close, dispose, integration
--- toggle or Core reload. Idempotent.
+-- Idempotent. Every way the view stops being ours must reach this, or
+-- opConfig flags stay on native bank children.
 M.Stop = function()
   unflagAll()
   drawing = nil
   pending = {}
-  recent = nil -- its cell belongs to the dead drawing
+  recent = nil
   stop()
 end
 
--- main.lua injects this into bankutil.SetViewProvider.
 M.Provider = { draw = M.Draw, stop = M.Stop }
 
 return M

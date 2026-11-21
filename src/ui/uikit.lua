@@ -1,23 +1,15 @@
--- Shared UI plumbing, served to every ui/ module:
---   * interface sounds, silenced as one by the sfx setting
---   * the per-window delayed tooltip and the instant blocked-action hint
---   * the single Logic-tick heartbeat that drives all time-based UI
---   * PrettyUI chrome repairs: title centring, drag-handle insets,
---     satellite placement, the search field's clear button
---   * the name-search matcher both list surfaces share
---   * the bank-engine reads both engines share: obj names, bank
---     components, op lists, the smallest available body font
+-- Shared UI plumbing for every ui/ module: sounds, the per-window tooltip,
+-- the single Logic-tick heartbeat, pointer scaling, PrettyUI chrome repairs
+-- and the reads both bank engines share. Nothing here knows about presets.
 local M = {}
+local prefs = require("core/prefs")
 
--- ---- interface sounds ---------------------------------------------------
+M.BLOCKED_SFX = 29596
+M.CLICK_SFX = 36961
+M.DROP_SFX = 4174
 
-M.BLOCKED_SFX = 29596 -- refused action
-M.CLICK_SFX = 36961 -- standard button
-M.DROP_SFX = 4174 -- confirmed drag-and-drop or "Move to"
-
--- Plays a sound unless the user has silenced the plugin's audio.
 M.PlaySfx = function(sfxId)
-  if PersistentDB:GetBool("ui.sfxOff") == true then return end
+  if prefs.GetBool("ui.sfxOff") == true then return end
   pcall(function()
     local sp = audio.SoundPlaybackParams.new()
     sp.type = audio.SoundType.SCRIPT
@@ -26,22 +18,19 @@ M.PlaySfx = function(sfxId)
   end)
 end
 
--- Plays one of a set at random, as the client's own variant sets do.
 M.PlayRandomSfx = function(set)
   M.PlaySfx(set[math.random(#set)])
 end
 
--- ---- Logic-tick heartbeat -------------------------------------------------
--- One Event.Logic subscription drives every time-based UI concern. Tickers
--- are named, so re-registering a name replaces it rather than stacking.
 local tick = 0
 local tickers = {}
 
--- Shared timebase, in ticks (~50/s).
+-- Ticks since load, about 50 a second.
 M.Now = function()
   return tick
 end
 
+-- Registering an existing name replaces that ticker.
 M.AddTicker = function(name, fn)
   tickers[name] = fn
 end
@@ -55,10 +44,11 @@ local function interfaceScale()
   return scale
 end
 
-local pointerScale = nil -- measured window-pixels-per-interface-unit
+local pointerScale = nil -- window pixels per interface unit
 local pointerScaleFor = nil -- the Interface Scale it was measured at
 
--- Measures the pointer scale from a hook's component-relative coordinates.
+-- x, y are a hook's component-relative coordinates. The component must be at
+-- its laid-out geometry: one just moved or stretched reports a stale xyGlobal.
 M.CalibratePointer = function(component, x, y)
   if type(x) ~= "number" or type(y) ~= "number" then return end
   local raw, origin = Mouse.GetPosition(), nil
@@ -75,7 +65,8 @@ M.CalibratePointer = function(component, x, y)
   pointerScaleFor = interfaceScale()
 end
 
--- The pointer in interface coordinates, the space components are placed in.
+-- The pointer in interface coordinates. Mouse.GetPosition() is in window
+-- pixels, which match component x/y and xyGlobal only at 100% Interface Scale.
 M.MousePos = function()
   local m = Mouse.GetPosition()
   if m == nil then return nil end
@@ -86,7 +77,6 @@ M.MousePos = function()
   return { x = m.x / scale, y = m.y / scale }
 end
 
--- Logs each distinct failure once per load.
 local reported = {}
 M.ReportOnce = function(where, err)
   local key = where .. tostring(err)
@@ -95,16 +85,15 @@ M.ReportOnce = function(where, err)
   log(formatStr("[PV] {} failed: {}", where, tostring(err)))
 end
 
--- ---- shared delayed tooltip ------------------------------------------------
--- One Tooltip per window content, retargeted and retexted per button after a
--- hover dwell, rather than one tooltip per button.
-local TIP_DELAY_TICKS = 40 -- ~0.8s dwell before a tooltip shows
-M.TIP_BLOCKED_TICKS = 100 -- ~2s on screen for "can't do that" popups
+local TIP_DELAY_TICKS = 40
+M.TIP_BLOCKED_TICKS = 100
 
-local sharedTips = {} -- keyed by window content
+-- One Tooltip per window content: a tooltip reads its target's local
+-- coordinates, so it must share the target's parent.
+local sharedTips = {}
 local pendingTip = nil -- { comp, text, parent, at }
-local tipExpireAt = nil -- tick to auto-hide an instant tooltip
-local defaultTipParent = nil -- used when a call site passes no parent
+local tipExpireAt = nil
+local defaultTipParent = nil
 
 M.SetDefaultTipParent = function(content)
   defaultTipParent = content
@@ -123,7 +112,7 @@ local function showTipFor(component, text, parent)
     local tip = sharedTips[parent]
     if tip == nil then
       tip = prettyui.Tooltip.attach(component, parent, text, {
-        onMouseOver = function() end, -- we drive Show/Hide ourselves
+        onMouseOver = function() end, -- Show and Hide are driven from here
         onMouseLeave = function() end,
       })
       if tip == nil then return end
@@ -136,18 +125,14 @@ local function showTipFor(component, text, parent)
   if not ok then log(formatStr("[PV] tooltip failed: {}", tostring(err))) end
 end
 
--- A tooltip that appears at once and dismisses itself: the blocked-action
--- hint, where a dwell delay would mean the user never sees why.
 M.ShowInstantTip = function(component, text, parent, expireTicks)
   showTipFor(component, text, parent)
   if expireTicks then tipExpireAt = tick + expireTicks end
 end
 
--- Attaches hover handling to a component.
---   parentContent - the window content the COMPONENT lives in
---   text          - a string, or a function returning (text, opts), where
---                   opts = { instant = bool, expire = ticks }
---   onOver/onLeave - optional extra hover behaviour
+-- parentContent is the window content the component lives in. text is a
+-- string, or a function returning (text, { instant = bool, expire = ticks }).
+-- onOver/onLeave share this subscription: a second one on the hook is unreliable.
 M.AttachDelayedTooltip = function(component, text, parentContent, onOver, onLeave)
   component:Subscribe(ui.Hook.ONMOUSEOVER, "pvTip", function()
     if onOver then pcall(onOver) end
@@ -171,7 +156,6 @@ M.AttachDelayedTooltip = function(component, text, parentContent, onOver, onLeav
   end)
 end
 
--- Destroys the pooled tooltips on window teardown; the pool refills lazily.
 M.DestroyTips = function()
   for _, tip in pairs(sharedTips) do
     pcall(function() tip:Destroy() end)
@@ -189,7 +173,7 @@ Event.Logic.Subscribe("pvUikitTick", function()
     showTipFor(t.comp, t.text, t.parent)
   end
   if tipExpireAt and tick >= tipExpireAt then
-    M.HideTip() -- clears tipExpireAt itself
+    M.HideTip()
   end
   for _, fn in pairs(tickers) do pcall(fn) end
 end)
@@ -199,10 +183,9 @@ M.Shutdown = function()
   pcall(function() Event.Logic.Unsubscribe("pvUikitTick") end)
 end
 
--- ---- PrettyUI window-chrome repairs -----------------------------------------
 local TITLE_H = 32 -- PrettyUI Window title-bar height
 
--- Re-spans a window title symmetrically.
+-- PrettyUI centres the title across an asymmetric span (12px left, 48px right).
 M.CentreTitle = function(w)
   pcall(function()
     w.titleText:SetPos(48, 2)
@@ -210,15 +193,15 @@ M.CentreTitle = function(w)
   end)
 end
 
--- Re-syncs a PrettyUI window's invisible title-drag layer after a move.
+-- Call after moving w.root: the title-drag layer is parented outside the
+-- window and stays behind, eating hover and clicks, until SetSize re-places it.
 M.SyncWindowChrome = function(w)
   pcall(function() w:SetSize(w.root.width, w.root.height) end)
 end
 
--- Places a satellite window (icon picker, share, import) on open.
--- Standalone re-anchors to its owner window every open; integrated
--- (BankUtils column) places it at defX/defY ONCE and afterwards leaves it
--- wherever the user dragged it. st is the caller's per-window state table.
+-- Standalone anchors the window at ax, ay on every open. Integrated places it
+-- at defX, defY once and then leaves it where the user dragged it. st is the
+-- caller's per-window state table.
 M.PlaceSatellite = function(w, st, integrated, ax, ay, defX, defY)
   if integrated then
     if st.placed ~= true then
@@ -231,10 +214,7 @@ M.PlaceSatellite = function(w, st, integrated, ax, ay, defX, defY)
   end
 end
 
--- A 16px clear ("x") icon for a search field: hidden while the field is
--- empty, lit variant on hover, click hands control to the caller's onClear.
--- The caller positions it inside the field's right edge and drives
--- SetVisible from the field's onChange.
+-- The caller positions the returned root and drives SetVisible.
 local CLEAR_REST = id.Sprite.RS3_ICON_CLEAR_16PX_0
 local CLEAR_HOVER = id.Sprite.RS3_ICON_CLEAR_16PX_1
 M.AttachClearButton = function(parent, onClear)
@@ -255,20 +235,19 @@ M.AttachClearButton = function(parent, onClear)
       if v == true then
         pcall(function() spr:MoveToFront() end)
       else
-        spr.spriteID = CLEAR_REST -- never reopen stuck on the hover art
+        spr.spriteID = CLEAR_REST -- or it reappears on the hover art
       end
     end,
   }
 end
 
-local TITLE_DRAG_RIGHT = 34 -- PrettyUI's own CLOSE_SIZE (20) + 14
+local TITLE_DRAG_RIGHT = 34 -- PrettyUI's CLOSE_SIZE (20) + 14
 
--- Clears `insetLeft` px at the left end of a window's title bar so a button
--- there stays clickable. Must be called every tick, not once.
+-- Keeps insetLeft px at the left of the title bar clear of the drag handle.
+-- Call it every tick: PrettyUI resets the handle's geometry by itself.
 M.ApplyTitleInset = function(w, insetLeft)
   if w == nil or w.root == nil or w.titleDrag == nil then return end
-  -- Mid-drag the handle is expanded over the whole screen so a fast cursor
-  -- cannot escape it; touching it then would kill the drag.
+  -- mid-drag the handle covers the whole screen; resizing it kills the drag
   if w.dragFeedback ~= nil then return end
   pcall(function()
     if w.root.hidden == true then return end
@@ -278,8 +257,8 @@ M.ApplyTitleInset = function(w, insetLeft)
   end)
 end
 
--- Case-insensitive name filter: plain substring, or an anchored wildcard
--- pattern when the query holds "*". An empty query matches everything.
+-- Case-insensitive substring match, or an anchored wildcard match when the
+-- query holds "*". An empty query matches everything.
 M.MatchesSearch = function(name, query)
   if query == nil or query == "" then return true end
   local n, q = string.lower(name or ""), string.lower(query)
@@ -290,11 +269,9 @@ M.MatchesSearch = function(name, query)
   return string.find(n, pat) ~= nil
 end
 
--- ---- drag-to-reorder plumbing ------------------------------------------------
-
--- The drop gap for a pointer at content-y `y` among `rows` ({ id, y0, y1 },
--- top to bottom): the rows either side of it and the y of the line between.
--- `above` or `below` is nil at the ends; nil overall when `rows` is empty.
+-- rows is { { id, y0, y1 }, ... } top to bottom, y in the same content space.
+-- Returns { above, below, lineY }; above or below is nil at the ends, and the
+-- result is nil when rows is empty.
 M.GapAt = function(rows, y)
   if #rows == 0 then return nil end
   for i, r in ipairs(rows) do
@@ -306,9 +283,9 @@ M.GapAt = function(rows, y)
   return { above = last, below = nil, lineY = last.y1 }
 end
 
--- The preset id to hand store.ReorderPreset so `movedId` lands in the gap
--- between `aboveId` and `belowId`, or nil when it already sits there.
--- `orderIdx` is store.PresetOrderIndex().
+-- The id to hand store.ReorderPreset so movedId lands between aboveId and
+-- belowId, or nil when it is already there. orderIdx is
+-- store.PresetOrderIndex(): the side is decided on stored order, not screen order.
 M.GapTarget = function(orderIdx, movedId, aboveId, belowId)
   local m = orderIdx[movedId]
   if m == nil then return nil end
@@ -319,17 +296,14 @@ M.GapTarget = function(orderIdx, movedId, aboveId, belowId)
   return nil
 end
 
--- ---- shared bank-engine plumbing --------------------------------------------
-
--- An obj id's display name from the client's config, or nil when it cannot
--- be resolved.
+-- Returns the raw name value, or nil when the id does not resolve.
 M.ObjName = function(objId)
   local n = nil
   pcall(function() n = config.Obj.FromID(objId).name end)
   return n
 end
 
--- A component of the bank interface (517) by static id, or nil.
+-- staticId is a component of the bank interface (517).
 M.BankComponent = function(staticId)
   local c = nil
   pcall(function()
@@ -338,7 +312,7 @@ M.BankComponent = function(staticId)
   return c
 end
 
--- A component's op names as { { idx, name }, ... }.
+-- Returns { { idx, name }, ... }.
 M.ReadOps = function(component)
   local list = {}
   pcall(function()
@@ -354,7 +328,7 @@ M.ReadOps = function(component)
   return list
 end
 
--- Smallest available body font and its line height, probed once.
+-- Returns font, lineHeight. A missing font enum resolves to -1, not nil.
 local smallFont = nil
 M.SmallFont = function()
   if smallFont ~= nil then return smallFont.font, smallFont.h end
@@ -371,8 +345,8 @@ M.SmallFont = function()
   return smallFont.font, smallFont.h
 end
 
--- Points a PrettyUI SpriteButton at raw sprite ids. With no `active` art,
--- the hover state is emulated by brightening a dimmed idle.
+-- Points a PrettyUI SpriteButton at raw sprite ids, which its constructor
+-- refuses. The caller sets btn._pvActive to hold the button in its lit state.
 M.SetButtonSprites = function(btn, neutral, active)
   btn.sprites = { neutral = neutral, active = active or neutral }
   local base = btn._UpdateState
@@ -385,8 +359,6 @@ M.SetButtonSprites = function(btn, neutral, active)
       end)
     end
   else
-    -- With real hover art, _pvActive holds that art instead of a brightness
-    -- lift, so the button still reads "on" while its thing is open.
     btn._UpdateState = function(selfBtn)
       base(selfBtn)
       pcall(function()

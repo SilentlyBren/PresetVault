@@ -1,14 +1,14 @@
 -- Character identity for per-character vaults, from
--- `Player.GetTrackingID()`.
---
--- The ID is used only as a local PersistentDB key suffix. It is never shown
--- to the user, written into a preset, or transmitted anywhere.
+-- `Player.GetTrackingID()`. The id is used only as a local PersistentDB key
+-- suffix.
 local M = {}
+local prefs = require("core/prefs")
 
-local RESOLVE_TIMEOUT = 600
+-- counted in Update() calls, not ticks
+local RESOLVE_TIMEOUT = 300
 
-local cached = nil -- resolved id, as a decimal string
-local waited = 0   -- Update() calls spent waiting for the id this session
+local cached = nil -- decimal string
+local waited = 0
 
 M.HasPermission = function()
   local ok, has = pcall(function()
@@ -17,14 +17,12 @@ M.HasPermission = function()
   return ok and has == true
 end
 
--- True when the user has asked for per-character vaults.
 M.Enabled = function()
-  return PersistentDB:GetBool("vault.multiChar") == true
+  return prefs.GetBool("vault.multiChar") == true
 end
 
--- The id arrives as a plain Lua integer; its decimal form is the key
--- suffix. Anything else reads as "not resolved", which locks the vault
--- rather than keying it off a guessed value.
+-- Anything but a plain integer reads as unresolved, which locks the vault
+-- instead of keying it off a value in an unknown format.
 local function readId()
   local ok, value = pcall(function() return Player.GetTrackingID() end)
   if not ok or value == nil then return nil end
@@ -32,12 +30,10 @@ local function readId()
   return tostring(value)
 end
 
--- Polls for the ID until it arrives. Cheap once resolved, and safe to call
--- when the feature is off or unpermitted.
 M.Update = function()
   if cached ~= nil then return end
   if not M.HasPermission() then
-    waited = 0 -- a later grant starts its wait from scratch
+    waited = 0
     return
   end
   local id = readId()
@@ -48,17 +44,12 @@ M.Update = function()
   waited = waited + 1
 end
 
--- Drops the cached ID. Called on logout and on any permission change.
 M.Forget = function()
   cached = nil
   waited = 0
 end
 
--- "off"           - per-character vaults disabled; the shared vault is in use
--- "ready"         - ID resolved, M.Get() is safe
--- "nopermission"  - enabled, but trackingAccess was not granted
--- "resolving"     - enabled and permitted, ID not transmitted yet (post-login)
--- "unavailable"   - enabled and permitted, but the ID never arrived
+-- Returns "off", "ready", "nopermission", "resolving" or "unavailable".
 M.State = function()
   if not M.Enabled() then return "off" end
   if cached ~= nil then return "ready" end
@@ -67,12 +58,12 @@ M.State = function()
   return "resolving"
 end
 
--- The resolved tracking ID, or nil when it is not known yet.
+-- nil means the id is not known yet; callers must wait, not fall back.
 M.Get = function()
   return cached
 end
 
--- The current character's display name. A UI label only, never a key.
+-- A UI label only, never a key. nil when not readable.
 M.DisplayName = function()
   local name
   pcall(function() name = PlayerList.Self().displayName end)

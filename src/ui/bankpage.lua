@@ -1,33 +1,16 @@
--- The preset bank view, standalone "panel model" engine.
---
--- While the bank is open on the All Items tab, every native bank slot is
--- HIDDEN and the preset is drawn in its place: pooled ui.Sprite cells over
--- canvas chrome (panel, titled dividers, worn doll, backdrops, tints).
---
--- Hovering a cell parks the one claimed bank child underneath it - visible
--- to the engine, but masked behind the opaque canvas - and opens a
--- click-through hole. The click, menu and tooltip are therefore all the
--- game's own. Nothing is ever moved en masse.
---
--- RULES THIS ENGINE LIVES BY:
---   * EVERY grid iteration must skip our own dynamicIDs (ownDynIds) - our
---     components are grid children too, and a sweep would hide our own rig.
---   * Only create grid children once the grid displays (visibleGlobal).
---   * The parked child must stay BEHIND the canvas (MoveToBack).
+-- The preset bank view, standalone engine: hides the native bank slots, draws
+-- the preset over them, and parks the hovered item's real bank child under
+-- its cell so the click, menu and tooltip stay the game's own.
 local M = {}
+local prefs = require("core/prefs")
 
 local BASE = 517 * 65536 -- bank interface
-local BANK_INV_STATIC = 201 -- BANK__BANK_INV: the 1920-slot grid
-local EMPTY_OBJ = 48447 -- associatedObjectID of empty bank slots
+local BANK_INV_STATIC = 201
+local EMPTY_OBJ = 48447 -- associatedObjectID of an empty bank slot
 
--- Decorative custom-tab titles and dividers (203 TAB_SEPARATORS, 204
--- TAB_DIVIDERS) are hidden while a view is active.
+-- grid siblings, so the canvas (a grid child) cannot cover them
 local DECOR_STATICS = { 203, 204 }
 
--- ---- layout / shared view maths ---------------------------------------------
--- Geometry, palette and the pure model all live in core/presetview. This
--- module keeps only what is component-bound: claiming children, parking,
--- hiding, repairs.
 local P = require("core/presetview")
 local invread = require("core/invread")
 local ORIGIN_X, TITLE_Y, ORIGIN_Y = P.ORIGIN_X, P.TITLE_Y, P.ORIGIN_Y
@@ -41,24 +24,28 @@ local wornPos = P.WornPos
 
 local DIVIDER_COLOUR, TITLE_COLOUR = P.DIVIDER_COLOUR, P.TITLE_COLOUR
 local WHITE, GHOST_TINT, CONNECTOR_TINT = P.WHITE, P.GHOST_TINT, P.CONNECTOR_TINT
--- The panel is opaque on purpose, not decoration.
 local PANEL_COLOUR = P.PANEL_COLOUR
 local DIM_ALPHA = P.DIM_ALPHA
 local MISS_RED, UNDER_ORANGE = P.MISS_RED, P.UNDER_ORANGE
 local SHORTFALL_COLOUR = P.SHORTFALL_COLOUR
 
--- ---- state ------------------------------------------------------------------
-local canvas = nil -- ONE ui.Canvas: dividers, titles, backdrops, ghosts, tints
-local cellPool = {} -- pooled ui.Sprite cells, reused across views in a session
-local labelPool = {} -- pooled ui.Text shortfall labels (must out-rank sprites)
-local ownDynIds = {} -- dynamicIDs of OUR grid children (excluded from sweeps)
-local view = nil -- active view state; nil = no page shown
+local canvas = nil
+local cellPool = {}
+local labelPool = {}
+-- dynamicIDs of our own grid children; every grid walk must skip them
+local ownDynIds = {}
+local view = nil
 local tickCount = 0
 local forceRepairTicks = 0
-local reclaimWatch = 0 -- post-event window where emptied claims are re-checked per tick
+local reclaimWatch = 0 -- ticks left of per-tick emptied-claim checks
 M.activePresetId = nil
 M.activePreset = nil
-M.OnViewChanged = nil -- pvwin.lua hook, fired after Show/Restore
+M.OnViewChanged = nil
+local quiet = 0 -- above zero, view-changed notifications are held back
+
+local function fireViewChanged()
+  if quiet == 0 and M.OnViewChanged then pcall(M.OnViewChanged) end
+end
 
 local function getGrid()
   return ui.Interfaces:GetComponent(BASE + BANK_INV_STATIC)
@@ -80,9 +67,9 @@ local function onAllItemsTab()
   return hi == 0x88
 end
 
--- True when a native bank search or filter is active. Both re-filter the
--- grid, so a live view's claims stop lining up with what is shown.
-local CANCEL_STATIC = 257 -- BANK__BOTTOM_PANEL_CANCEL
+-- English-only label match: another client language, or a failed read,
+-- returns false.
+local CANCEL_STATIC = 257
 local CANCEL_LABEL_CAT, CANCEL_LABEL_DYN = 0, 9
 local function nativeSearchActive()
   local visible = false
@@ -120,7 +107,6 @@ local uikit = require("ui/uikit")
 local playSfx = uikit.PlaySfx
 local BLOCKED_SFX = uikit.BLOCKED_SFX
 
--- Pulses a glow on the All Items tab when a view is refused for wrong-tab.
 local glowTicks = 0
 local glowEdges = {}
 local function clearGlow()
@@ -134,7 +120,6 @@ end
 local function flashAllItemsTab()
   clearGlow()
   playSfx(BLOCKED_SFX)
-  -- first candidate component with a real size wins
   local btn, cw, ch = nil, 0, 0
   for _, sid in ipairs({ 165, 166, 167, 168 }) do
     local c = ui.Interfaces:GetComponent(BASE + sid)
@@ -166,7 +151,7 @@ local function flashAllItemsTab()
   if not ok or #glowEdges == 0 then glowEdges = {} return end
 
   glowTicks = 0
-  local PERIOD = 46 -- ticks per pulse; ~3 pulses then stop
+  local PERIOD = 46 -- ticks
   Event.Logic.Subscribe("pvGlow", function(event)
     glowTicks = glowTicks + 1
     local phase = (glowTicks % PERIOD) / PERIOD
@@ -178,17 +163,13 @@ local function flashAllItemsTab()
     if glowTicks >= PERIOD * 3 then clearGlow() end
   end)
 end
--- The BankUtil Core route (core/bankutil) refuses with "not_all_items"
--- and deserves the same chime + pulse as our own wrong-tab
--- refusal, so pvwin.lua needs to reach this.
 M.FlashWrongTab = flashAllItemsTab
 
--- ---- claiming ---------------------------------------------------------------
--- Pools bank children by obj id, skipping our own components, and reads
--- true counts from inv 95.
+-- Unit counts come from inv 95, never associatedObjectQuantity, which may
+-- hold our own badge override.
 local function scanBank(grid)
   local pools = {}
-  local emptyChildren = {} -- child -> true where the client reports 0 units
+  local emptyChildren = {}
   grid:IterateDynamicComponents(function(child, visible)
     pcall(function()
       if ownDynIds[child.dynamicID] then return end
@@ -200,12 +181,9 @@ local function scanBank(grid)
       if q ~= nil and q <= 0 then emptyChildren[child] = true end
     end)
   end)
-  -- Stocked stacks claim BEFORE placeholders (bank order kept within each
-  -- group). Without this, a multi-stack unique - several rune pouches,
-  -- say - breaks the moment one is withdrawn: its placeholder keeps the
-  -- bank SLOT, so pure bank order hands poolIndex 1 (the compact merged
-  -- cell's only claim) the empty Remove-placeholder child while real
-  -- stacks of the same obj sit unclaimed behind it.
+  -- Stocked stacks order before placeholders, so poolIndex 1 is never an
+  -- emptied stack while live ones exist. The quantity read above only
+  -- orders the pool; a nil quantity counts as live.
   for _, pool in pairs(pools) do
     if #pool > 1 then
       local live, empty = {}, {}
@@ -227,17 +205,10 @@ end
 
 local carriedCounts = invread.Carried
 
--- The name guard for noted-form resolution (noted = base + 1), injected
--- into the pure model so it stays free of game globals.
 local nameOf = uikit.ObjName
 
--- Builds the model via core/presetview, then attaches the actual bank
--- children its claim order picked. A bank STACK is one child that may serve
--- two cells (Backpack + BoB); a unique item's cells each claim a DISTINCT
--- child in pool order, and a poolIndex past the pool means no child.
+-- One child may serve several cells; a poolIndex past the pool means no child.
 local function buildCells(preset, pools, counts, carried, exact, emptyChildren)
-  -- the model's bank descriptor: per resolved obj, how many native stacks
-  -- (children, placeholders included) and how many units (inv 95 truth)
   local bank = {}
   for obj, pool in pairs(pools) do
     bank[obj] = { stacks = #pool, units = counts[obj] or 0 }
@@ -248,15 +219,13 @@ local function buildCells(preset, pools, counts, carried, exact, emptyChildren)
       local pool = pools[c.srcObj]
       if pool ~= nil then c.child = pool[c.poolIndex] end
     end
-    -- whether this claim took a placeholder at build time - the repair
-    -- tick's emptied-claim trigger must only fire on claims that emptied
-    -- AFTER the build (see scanBank)
+    -- a placeholder claimed at build; reclaimPass must skip these or it
+    -- re-fires on every pass
     c.claimedEmpty = c.child ~= nil
       and (emptyChildren or {})[c.child] == true
-    -- and empty claims absorb carried coverage first (P.CellRemaining)
     c.claimGone = c.claimedEmpty
-    -- Native position and display quantity, captured BEFORE we ever park
-    -- or relabel this child. Restore puts both back.
+    -- captured before anything parks or stamps the child, so these are
+    -- the client's own values
     if c.child ~= nil then
       pcall(function()
         c.nx, c.ny = c.child.x, c.child.y
@@ -267,7 +236,6 @@ local function buildCells(preset, pools, counts, carried, exact, emptyChildren)
   return model
 end
 
--- ---- chrome (ONE canvas - primitives are budget-free) -----------------------
 local function ensureCanvas(grid)
   if canvas ~= nil then return true end
   local ok = pcall(function()
@@ -284,9 +252,7 @@ local function drawChrome(v)
   if canvas == nil then return end
   pcall(function()
     local cv = canvas
-    -- The backdrop spans the WHOLE grid component, not just the preset
-    -- content box, so every native slot stays masked at any scroll
-    -- position rather than leaving bare bank beside or below the view.
+    -- the whole grid, so natives stay masked at any scroll position
     local gw, gh = CHROME_W, v.chromeH
     pcall(function()
       local grid = getGrid()
@@ -298,25 +264,22 @@ local function drawChrome(v)
     cv:SetSize(gw, gh)
     cv:Clear()
     local font = id.Font.CINZEL_13PT_BOLD
-    -- first, so everything else on the canvas draws over it
+    -- opaque: masks native art the client re-creates un-hidden after a
+    -- withdrawal
     cv:AddRectangle(0, 0, gw, gh, PANEL_COLOUR)
     local function divider(y, text)
       cv:AddText(ORIGIN_X - 2, y - 3, text, font, TITLE_COLOUR)
       cv:AddRectangle(ORIGIN_X, y + 18, GRID_W, 1, DIVIDER_COLOUR)
     end
-    -- page title: section-title text with no underline rule
     cv:AddText(ORIGIN_X - 2, TITLE_Y - 3, tostring(v.preset.name or ""),
       font, TITLE_COLOUR)
     divider(ORIGIN_Y, "Worn")
     divider(PACK_HEADER_Y, "Backpack")
     if v.bobHeaderY ~= nil then divider(v.bobHeaderY, "Beast of Burden") end
     local slotBg = prettyui.Sprites.ITEM_SLOT_BACKGROUND
-    -- the game's connector lines first, so slot art covers their ends
-    -- connector x is relative to the centre column's LEFT EDGE
     for _, c in ipairs(WORN_CONNECTORS) do
       cv:AddSprite(DOLL_CX + c[1], DOLL_Y + c[2], c[3], c[4], c[5], CONNECTOR_TINT)
     end
-    -- doll slots: same backdrop + art geometry as every other cell
     for slotIdx, m in pairs(WORN_BANK) do
       local p = wornPos(slotIdx)
       cv:AddSprite(p.x + SLOT_BG_DX, p.y + SLOT_BG_DY, BOX, BOX, slotBg, WHITE)
@@ -324,41 +287,28 @@ local function drawChrome(v)
         cv:AddSprite(p.x, p.y, 32, 32, m[3], GHOST_TINT)
       end
     end
-    -- exact layout: empty slots keep their backdrop, so a gap in the
-    -- snapshot reads as a gap rather than the grid ending early
     for _, p in ipairs(v.emptyBg or {}) do
       cv:AddSprite(p.x, p.y, BOX, BOX, slotBg, WHITE)
     end
-    -- cell backdrops + missing/partial tints + shortfall labels
     for _, c in ipairs(v.cells) do
-      -- box geometry differs: native 36x36 doll slots vs the 40x40 compact
-      -- grid cells (doll backdrops are drawn above, with the connectors)
       local bx, by, bs = c.x + SLOT_BG_DX, c.y + SLOT_BG_DY, BOX
-      -- doll backdrops are drawn above (with the connectors); only the
-      -- compact-grid cells need one here. Tints use the same box either way.
       if not c.doll then cv:AddSprite(bx, by, bs, bs, slotBg, WHITE) end
       if c.missing then
         cv:AddRectangle(bx, by, bs, bs, MISS_RED)
       elseif c.partial then
         cv:AddRectangle(bx, by, bs, bs, UNDER_ORANGE)
       end
-      -- shortfall labels are NOT drawn here: canvas art sits below the cell
-      -- sprites (so a parked child can render), which would bury the text
-      -- under the item icon. They are pooled ui.Text components instead.
     end
   end)
 end
 
--- ---- drawn cells (pooled sprites; a cell is its own hover armer) ------------
 local hotIndex = nil
-local rearmPending = false -- Show asks onTick to re-hover the cell under the pointer
--- Forward declarations: the hover handlers below call into the one-click
--- machinery, which is defined further down (a later `local function` is
--- invisible to an earlier closure - it would silently resolve to nil).
+local rearmPending = false
+-- declared ahead: the hover handlers below call these
 local scanOps, cellRemaining, flagCell, applyCellDisplay, updateDisplays, refreshCounts
 
--- The quantity a released child should display: the LIVE total for a bank
--- STACK, nothing at all otherwise.
+-- nil for a non-stacked cell: its child is never stamped and must never be
+-- written, or an emptied stack's own 0 is overwritten.
 local function nativeQty(c)
   if not c.stacked then return nil end
   if view ~= nil and c.srcObj ~= nil then
@@ -377,8 +327,9 @@ local function unHot()
     if c.child ~= nil then
       pcall(function() c.child:Unsubscribe(ui.Hook.ONMOUSELEAVE, "pvLeave") end)
       pcall(function() c.child:Unsubscribe(ui.Hook.ONOP, "pvOp") end)
-      flagCell(c, false) -- leave no left-click override on a released item
-      -- Hand the native quantity back HERE, not only at Restore.
+      flagCell(c, false)
+      -- handed back here as well as in Restore, or a rebuild captures our
+      -- stamp as the child's own quantity
       local q = nativeQty(c)
       if q ~= nil then
         pcall(function()
@@ -387,11 +338,8 @@ local function unHot()
         end)
       end
       c.child.hidden = true
-      pcall(function() c.sprite.clickthrough = false end) -- cell takes hover again
-      -- Park it back where the client had it - but ONLY while still on the
-      -- All Items tab. Off-tab (a tab-switch bail), these coords are stale
-      -- and the client is about to re-lay-out the grid anyway; writing them
-      -- stranded the preset's items at the wrong spot until the next switch.
+      pcall(function() c.sprite.clickthrough = false end)
+      -- off the All Items tab these coords are stale and strand the item
       if c.nx ~= nil and onAllItemsTab() then
         pcall(function() c.child:SetPos(c.nx, c.ny) end)
       end
@@ -403,30 +351,23 @@ end
 local function goHot(i)
   if view == nil or hotIndex == i then return end
   local c = view.cells[i]
-  if c == nil or c.child == nil then return end -- missing cells stay inert
+  if c == nil or c.child == nil then return end
   unHot()
   hotIndex = i
   pcall(function()
-    -- THE PANEL MODEL: the claimed bank child is parked under the cell
-    -- VISIBLE but masked, behind the opaque canvas, so none of its native
-    -- art shows. Our own sprite stays on screen throughout; the only thing
-    -- hover changes is that the cell stops eating input, so the click falls
-    -- through to the real item beneath.
+    -- the child is parked visible but must stay behind the opaque canvas
     c.child:SetPos(c.x, c.y)
     c.child.hidden = false
-    pcall(function() c.child:MoveToBack() end) -- stay under the canvas
-    c.sprite.clickthrough = true -- open the hole over this cell only
-    -- our sprite no longer takes input, so the CHILD owns the leave event
+    pcall(function() c.child:MoveToBack() end)
+    c.sprite.clickthrough = true
+    -- a click-through sprite gets no hover events, so the child owns the leave
     c.child:Subscribe(ui.Hook.ONMOUSELEAVE, "pvLeave", function()
       pcall(unHot)
     end)
-    -- This cell's own one-click default (the per-hover flag is what lets a
-    -- shared stack serve two cells with different needs).
     flagCell(c, true)
     applyCellDisplay(c)
-    -- ONOP fires client-side AT the click with the op index: book the step
-    -- as pending and re-flag inside the same handler, so a spam-click always
-    -- sees fresh state instead of racing the server.
+    -- ONOP fires client-side at the click: book the amount and re-flag
+    -- here, before the server answers, so a spam click sees fresh state
     c.child:Subscribe(ui.Hook.ONOP, "pvOp", function(_, opID)
       pcall(function()
         if view == nil or c.srcObj == nil then return end
@@ -435,18 +376,13 @@ local function goHot(i)
         if map.all ~= nil and opID == map.all then
           amount = view.counts[c.srcObj] or 0
         elseif map.wear ~= nil and opID == map.wear then
-          -- a wear consumes one unit; book it so the NEXT click already
-          -- sees the cell as satisfied (Examine) instead of wearing a
-          -- second copy while the server catches up
           amount = 1
         else
           for _, st in ipairs(map.steps) do
             if st.idx == opID then amount = st.step break end
           end
         end
-        if amount == nil or amount <= 0 then return end -- Examine/other
-        -- directed at this cell's SECTION, so a BoB-cell withdraw dims the
-        -- BoB cell instead of counting down the backpack's copy
+        if amount == nil or amount <= 0 then return end
         local p = view.pending[c.srcObj] or { amount = 0, bySect = {} }
         p.amount = (p.amount or 0) + amount
         p.bySect = p.bySect or {}
@@ -468,11 +404,11 @@ local function ensureCell(i)
   local okC = pcall(function()
     s = ui.Sprite.new(grid)
     s:SetSize(36, 32)
-    s.clickthrough = false -- the cell IS its hover armer
+    s.clickthrough = false
     s.hidden = true
     pcall(function() ownDynIds[s.dynamicID] = true end)
-    -- pool index == cell index (Show assigns sequentially), so the closure's
-    -- i is the cell this sprite represents for its whole life
+    -- pool index equals cell index for the session, so i stays this
+    -- sprite's cell
     s:Subscribe(ui.Hook.ONMOUSEOVER, function()
       pcall(function() goHot(i) end)
     end)
@@ -482,31 +418,19 @@ local function ensureCell(i)
   return s
 end
 
--- ---- one-click ops ----------------------------------------------------------
--- A component's left-click default is its opConfig HIGH-PRIORITY op. Only
--- the HOVERED cell is ever flagged.
 scanOps = function(c)
   if c.opMap ~= nil then return c.opMap end
   c.opMap = P.BuildOpMap(uikit.ReadOps(c.child))
   return c.opMap
 end
 
--- How many units this cell still wants: a TOP-UP counter against live
--- inventory (backpack + worn + BoB). Supplies already carried when the view
--- opens count toward it, and deposits count back out.
---
--- Allocation and the maths are presetview's; unconfirmed clicks
--- (view.pending) count immediately, for the instant dim and re-flag.
 cellRemaining = function(c)
   if view == nil then return c.need end
   return P.CellRemaining(view, c, view.carried, view.pending)
 end
 
--- Sets, or clears, the hovered cell's left-click default:
---   equipment  -> Wear
---   stacked    -> largest Withdraw-N <= what this cell still needs;
---                 Withdraw-All when the need covers the live stack;
---                 Examine once satisfied, so a stray click cannot overshoot
+-- Only the hovered cell is flagged: one child can serve two cells with
+-- different needs.
 flagCell = function(c, on)
   if c == nil or c.child == nil then return end
   pcall(function()
@@ -519,36 +443,25 @@ flagCell = function(c, on)
     local map = scanOps(c)
     local remaining = cellRemaining(c)
     local live = (view ~= nil and c.srcObj ~= nil) and (view.counts[c.srcObj] or 0) or 0
-    -- the decision ladder (Examine when satisfied / Wear / Withdraw steps /
-    -- All) is the shared maths - see P.ChooseOp for the reasoning
     local want = P.ChooseOp(map, remaining, live,
       view ~= nil and view.equipObjs[c.obj] == true, c.stacked)
-    -- A claimed child with NO withdrawable/wearable op has only the
-    -- destructive "Remove placeholder" as its native default. Force Examine
-    -- (the one safe op). Guarded on want==nil so real stacks (which have
-    -- steps) and non-stacked singles are untouched.
+    -- a child with no withdraw or wear op is a placeholder, whose native
+    -- default is Remove placeholder
     if want == nil and #map.steps == 0 and map.all == nil and map.wear == nil
       and map.examine ~= nil then want = map.examine end
     if want ~= c.opHigh then
       if c.opHigh ~= nil then oc:SetOpIDHighPriority(c.opHigh, false) end
       c.opHigh = want
     end
-    if want ~= nil then oc:SetOpIDHighPriority(want, true) end -- re-assert
+    -- set even when unchanged: a client re-layout can drop the flag
+    if want ~= nil then oc:SetOpIDHighPriority(want, true) end
   end)
 end
 
--- Badge for one cell: a stacked cell counts DOWN its remaining need and
--- shows even a "1" (it's a withdraw count); once satisfied the number goes
--- away entirely rather than rendering "0".
 applyCellDisplay = function(c)
   local exactView = view ~= nil and view.exact == true
-  -- cellRemaining covers every cell, claimable or not - its basis is the
-  -- carried counts, which exist whether or not the bank holds the item.
-  -- Badge rules are shared maths; see P.Badge.
   local banked = (view ~= nil and c.srcObj ~= nil) and (view.claimQty[c.srcObj] or 0) or 0
   local rem, always, satisfied = P.Badge(c, cellRemaining(c), exactView, banked)
-  -- Remembered so the per-tick loop can re-stamp the parked child without
-  -- recomputing.
   c.lastRem, c.lastAlways = rem, always
   local function paint(comp)
     if comp == nil then return end
@@ -560,13 +473,12 @@ applyCellDisplay = function(c)
     end)
   end
   paint(c.sprite)
-  -- A parked STACKED child gets the same badge as the cell.
+  -- Native press feedback shows through the canvas, so the parked child
+  -- carries our badge. Stacked only: see nativeQty.
   if view ~= nil and hotIndex ~= nil and view.cells[hotIndex] == c
     and c.stacked then
     paint(c.child)
   end
-  -- Satisfied cells dim like a native placeholder: the item is on the
-  -- player now, so the cell is a reminder rather than a task.
   local done = satisfied
   if done ~= c.dimmed then
     c.dimmed = done
@@ -579,23 +491,17 @@ updateDisplays = function()
   for _, c in ipairs(view.cells) do applyCellDisplay(c) end
 end
 
--- Re-reads live bank counts and settles pending click predictions against
--- them (a confirmed drop consumes its prediction; stale ones expire, e.g. a
--- click the server refused because the backpack was full).
 refreshCounts = function()
   if view == nil then return end
   local fresh = invread.CountInv(95)
   P.ReconcilePending(view.pending, view.counts, fresh, tickCount)
   view.counts = fresh
-  -- Read in the SAME pass as the pending reconciliation above.
+  -- must be read in the same pass as the reconcile, or a unit counts twice
   view.carried = carriedCounts()
 end
 
--- Walks a cell's claim from a stack that has EMPTIED onto the next live
--- stack of the same obj, IN PLACE - no view rebuild. A hot cell re-parks
--- the new child under the stationary pointer via the normal unHot/goHot
--- pair, so one-click withdrawals chain across a multi-stack unique's
--- stacks (several rune pouches) without the pointer having to leave.
+-- Swaps an emptied claim onto the next live stack of the same obj. Not a
+-- rebuild: a rebuild re-claims the emptied child and drops the hover.
 local function reclaimCell(i, c, grid)
   local replacement = nil
   pcall(function()
@@ -606,9 +512,7 @@ local function reclaimCell(i, c, grid)
         if child.associatedObjectID ~= c.srcObj then return end
         local q = child.associatedObjectQuantity
         if q == nil or q <= 0 then return end
-        -- skip stacks other cells already claim. == compare, never a
-        -- table lookup: the iterate hands back fresh userdata that
-        -- raw-matches nothing, but __eq holds.
+        -- == compare, never a table lookup: the walk hands back fresh userdata
         for _, c2 in ipairs(view.cells) do
           if c2.child == child then return end
         end
@@ -617,16 +521,14 @@ local function reclaimCell(i, c, grid)
     end)
   end)
   if replacement == nil then
-    -- nothing live left to walk to: stop re-checking this claim. A
-    -- deposit that restocks the obj still rebuilds the view through the
-    -- more-of-a-short-item trigger.
+    -- nothing live left: stop re-checking this claim
     c.claimedEmpty = true
     return
   end
   local wasHot = hotIndex == i
   if wasHot then unHot() end
   c.child = replacement
-  c.opMap = nil -- the new child's op indices are its own
+  c.opMap = nil
   c.claimedEmpty = false
   c.claimGone = false
   pcall(function()
@@ -634,9 +536,7 @@ local function reclaimCell(i, c, grid)
     c.origQty = replacement.associatedObjectQuantity
   end)
   if wasHot then
-    -- re-park only while the pointer is still inside the cell; unreadable
-    -- mouse or geometry errs toward re-parking (a wiggle recovers either
-    -- way, and the sprite was never torn down so xyGlobal is settled)
+    -- an unreadable mouse or position errs toward re-parking
     local m, sg = nil, nil
     pcall(function() m = uikit.MousePos() end)
     pcall(function() sg = c.sprite.xyGlobal end)
@@ -648,17 +548,14 @@ local function reclaimCell(i, c, grid)
   end
 end
 
--- One sweep of the emptied-claim check (see reclaimCell). Cheap: a few
--- property reads per NON-STACKED claimed cell, nothing else.
+-- Non-stacked cells only: their children are never stamped, so the quantity
+-- read is the client's own.
 local function reclaimPass(grid)
   for i, c in ipairs(view.cells) do
     if c.child ~= nil and c.srcObj ~= nil and not c.stacked then
       local q = nil
       pcall(function() q = c.child.associatedObjectQuantity end)
       local gone = q ~= nil and q <= 0
-      -- satisfaction allocates to empty-claim cells FIRST (the dim must
-      -- land on the cell that can no longer be withdrawn from, not on
-      -- whichever cell is earliest) - see P.CellRemaining
       c.claimGone = gone
       if gone and c.claimedEmpty ~= true
         and (view.counts[c.srcObj] or 0) > 0 and cellRemaining(c) > 0 then
@@ -668,13 +565,8 @@ local function reclaimPass(grid)
   end
 end
 
--- Shortfall "-N" labels on missing and partial cells: real components,
--- pooled per bank session, kept ABOVE the cell sprites in z-order.
 local SHORTFALL_FONT, SHORTFALL_FONT_H = uikit.SmallFont()
 
--- Label = a 50% black plate with the red count on top (red on item art alone
--- was hard to read). Both pooled; the plate must sit above the cell sprite
--- and below its own text.
 local function ensureLabel(i)
   local e = labelPool[i]
   if e ~= nil then return e end
@@ -702,32 +594,33 @@ local function ensureLabel(i)
   return e
 end
 
--- ---- native hiding ----------------------------------------------------------
--- Hides every native slot; only the hot cell's claimed child is ever
--- un-hidden. Re-run on every repair.
-local function hideSweep(grid)
-  if view == nil then return end
-  local parkDyn = nil
-  if hotIndex ~= nil and view.cells[hotIndex] ~= nil then
-    pcall(function() parkDyn = view.cells[hotIndex].child.dynamicID end)
+local sweepParkDyn = nil
+local function hideChild(child)
+  local dyn = child.dynamicID
+  if ownDynIds[dyn] or dyn == sweepParkDyn then return end
+  if child.hidden ~= true then
+    child.hidden = true
+    if view.hiddenSet[dyn] == nil then
+      view.hiddenSet[dyn] = true
+      view.hiddenChildren[#view.hiddenChildren + 1] = child
+    end
   end
-  grid:IterateDynamicComponents(function(child, visible)
-    pcall(function()
-      local dyn = child.dynamicID
-      if ownDynIds[dyn] or dyn == parkDyn then return end
-      if child.hidden ~= true then
-        child.hidden = true
-        if view.hiddenSet[dyn] == nil then
-          view.hiddenSet[dyn] = true
-          view.hiddenChildren[#view.hiddenChildren + 1] = child
-        end
-      end
-    end)
-  end)
+end
+-- must return nothing: a true return from an iterate callback stops the walk
+local function hideVisit(child)
+  pcall(hideChild, child)
 end
 
--- Claims must still point at the right items (slot ids shift when a stack
--- empties or a placeholder-off withdrawal removes its slot).
+local function hideSweep(grid)
+  if view == nil then return end
+  sweepParkDyn = nil
+  if hotIndex ~= nil and view.cells[hotIndex] ~= nil then
+    pcall(function() sweepParkDyn = view.cells[hotIndex].child.dynamicID end)
+  end
+  grid:IterateDynamicComponents(hideVisit)
+end
+
+-- Slot ids shift when a withdrawal with placeholders off removes a slot.
 local function claimsValid()
   if view == nil then return true end
   for _, c in ipairs(view.cells) do
@@ -740,144 +633,143 @@ local function claimsValid()
   return true
 end
 
--- ---- lifecycle --------------------------------------------------------------
-local function onTick(event)
+-- Notifies the list only if the same preset did not come back.
+local function rebuildView()
+  local p = M.activePreset
+  quiet = quiet + 1
   pcall(function()
-    tickCount = tickCount + 1
-    if view == nil then return end
-    local grid = getGrid()
-    if grid == nil then return end
-
-    -- deferred hover re-arm (set by Show; see the comment there)
-    if rearmPending then
-      rearmPending = false
-      pcall(function()
-        local m = uikit.MousePos()
-        if m == nil or hotIndex ~= nil then return end
-        for i, c in ipairs(view.cells) do
-          if c.child ~= nil and c.sprite ~= nil then
-            local sg = c.sprite.xyGlobal
-            if sg ~= nil and m.x >= sg.x and m.x < sg.x + 36
-              and m.y >= sg.y and m.y < sg.y + 32 then
-              goHot(i)
-              break
-            end
-          end
-        end
-      end)
-    end
-
-    -- geometry re-assert: client re-layouts stomp positions but not hidden
-    -- flags, so pinning our handful of components is the whole repair story
-    pcall(function() canvas:SetPos(0, 0) end)
-    for i, c in ipairs(view.cells) do
-      if c.sprite ~= nil then
-        pcall(function() c.sprite:SetPos(c.x, c.y) end)
-      end
-      if c.label ~= nil then
-        pcall(function()
-          c.label.bg:SetPos(c.labelX, c.labelY)
-          c.label.text:SetPos(c.labelX + 3, c.labelY + 1)
-        end)
-      end
-      if i == hotIndex and c.child ~= nil then
-        pcall(function()
-          c.child:SetPos(c.x, c.y)
-          c.child.hidden = false
-          c.child:MoveToBack() -- stay masked behind the canvas
-          -- re-stamp each tick (STACKED cells only - uniques are never
-          -- stamped, see nativeQty): the client rewrites the child's
-          -- quantity to the true bank total when a withdrawal lands, and
-          -- the press feedback would then flash that number
-          if c.stacked and c.lastRem ~= nil then
-            c.child.associatedObjectQuantity = c.lastRem
-            c.child.associatedObjectQuantityMode = c.lastAlways
-              and ui.ObjectQuantityDisplayMode.ALWAYS
-              or ui.ObjectQuantityDisplayMode.MULTIPLE
-          end
-        end)
-      end
-    end
-
-    local structural = forceRepairTicks > 0 or tickCount % 25 == 0
-    if forceRepairTicks > 0 then forceRepairTicks = forceRepairTicks - 1 end
-    local watching = reclaimWatch > 0
-    if watching then reclaimWatch = reclaimWatch - 1 end
-    if not structural then
-      -- between structural passes, the post-event watch still re-checks
-      -- emptied claims per tick: a fresh placeholder's quantity can take a
-      -- few ticks to settle to 0, and the user's next click can beat the
-      -- 25-tick pass to it
-      if watching then reclaimPass(grid) end
-      return
-    end
-
-    if not onAllItemsTab() then
-      -- deposits into another tab's placeholder make the client switch tabs
-      -- itself; a custom tab suppresses repositioned children, so bail out
-      M.Restore()
-      return
-    end
-    -- A native search/filter re-filters the grid under us; get out of the
-    -- way rather than sit drawn with clicks misbehaving (same as the
-    -- integrated engine). English-only detection, so it stays up otherwise.
-    if nativeSearchActive() then
-      M.Restore()
-      return
-    end
-    if not claimsValid() then
-      local p = M.activePreset
-      M.Restore()
-      if p ~= nil then M.Show(p, true) end
-      return
-    end
-    -- settle predictions against server truth, then re-badge and re-assert
-    -- the hovered cell's flag (a re-layout can drop op config)
-    refreshCounts()
-
-    -- Walk claims off stacks that have EMPTIED into placeholders while
-    -- the bank still holds live stacks of the same obj (multi-stack
-    -- uniques: several rune pouches, one withdrawn). The placeholder
-    -- keeps its obj id, so claimsValid cannot see this - left alone, the
-    -- cell sits on the empty child and its native default reads
-    -- Remove-placeholder while real stacks go unclaimed. In-place swap,
-    -- hover preserved - see reclaimCell/reclaimPass.
-    reclaimPass(grid)
-
-    -- Rebuild only when the bank now holds MORE of something a cell is
-    -- short of.
-    for _, c in ipairs(view.cells) do
-      if c.missing or c.partial then
-        local now = (view.counts[c.obj] or 0) + (view.counts[c.obj - 1] or 0)
-        local atShow = (c.srcObj ~= nil) and (view.claimQty[c.srcObj] or 0) or 0
-        if now > atShow then
-          local p = M.activePreset
-          M.Restore()
-          if p ~= nil then M.Show(p, true) end
-          return
-        end
-      end
-    end
-
-    updateDisplays()
-    if hotIndex ~= nil then flagCell(view.cells[hotIndex], true) end
-    hideSweep(grid)
-    -- Re-assert the stack: children the client spawned after a withdrawal
-    -- can land ABOVE our canvas, which would unmask native art. Canvas over
-    -- natives, our cells and labels over the canvas.
-    pcall(function() canvas:MoveToFront() end)
-    for _, c in ipairs(view.cells) do
-      if c.sprite ~= nil then pcall(function() c.sprite:MoveToFront() end) end
-    end
-    for _, c in ipairs(view.cells) do
-      if c.label ~= nil then
-        pcall(function()
-          c.label.bg:MoveToFront()
-          c.label.text:MoveToFront()
-        end)
-      end
-    end
+    M.Restore()
+    if p ~= nil then M.Show(p, true) end
   end)
+  quiet = quiet - 1
+  if M.activePresetId ~= (p ~= nil and p.id or nil) then fireViewChanged() end
+end
+
+-- Tick bodies passed through pcall's arguments so the tick allocates no
+-- closures. One function per guarded step: merged, a failure in the first
+-- would skip the second.
+local function pinCanvas()
+  canvas:SetPos(0, 0)
+end
+local function pinSprite(c)
+  c.sprite:SetPos(c.x, c.y)
+end
+local function pinLabel(c)
+  c.label.bg:SetPos(c.labelX, c.labelY)
+  c.label.text:SetPos(c.labelX + 3, c.labelY + 1)
+end
+local function pinHot(c)
+  c.child:SetPos(c.x, c.y)
+  c.child.hidden = false
+  c.child:MoveToBack()
+  -- every tick: the client rewrites the quantity to the true bank total
+  -- when a withdrawal lands
+  if c.stacked and c.lastRem ~= nil then
+    c.child.associatedObjectQuantity = c.lastRem
+    c.child.associatedObjectQuantityMode = c.lastAlways
+      and ui.ObjectQuantityDisplayMode.ALWAYS
+      or ui.ObjectQuantityDisplayMode.MULTIPLE
+  end
+end
+local function frontCanvas()
+  canvas:MoveToFront()
+end
+local function frontSprite(c)
+  c.sprite:MoveToFront()
+end
+local function frontLabel(c)
+  c.label.bg:MoveToFront()
+  c.label.text:MoveToFront()
+end
+
+local function tickBody()
+  tickCount = tickCount + 1
+  if view == nil then return end
+  local grid = getGrid()
+  if grid == nil then return end
+
+  if rearmPending then
+    rearmPending = false
+    pcall(function()
+      local m = uikit.MousePos()
+      if m == nil or hotIndex ~= nil then return end
+      for i, c in ipairs(view.cells) do
+        if c.child ~= nil and c.sprite ~= nil then
+          local sg = c.sprite.xyGlobal
+          if sg ~= nil and m.x >= sg.x and m.x < sg.x + 36
+            and m.y >= sg.y and m.y < sg.y + 32 then
+            goHot(i)
+            break
+          end
+        end
+      end
+    end)
+  end
+
+  -- client re-layouts rewrite positions but leave hidden flags alone
+  pcall(pinCanvas)
+  for i, c in ipairs(view.cells) do
+    if c.sprite ~= nil then pcall(pinSprite, c) end
+    if c.label ~= nil then pcall(pinLabel, c) end
+    if i == hotIndex and c.child ~= nil then pcall(pinHot, c) end
+  end
+
+  local structural = forceRepairTicks > 0 or tickCount % 25 == 0
+  if forceRepairTicks > 0 then forceRepairTicks = forceRepairTicks - 1 end
+  local watching = reclaimWatch > 0
+  if watching then reclaimWatch = reclaimWatch - 1 end
+  if not structural then
+    -- the player's next click can beat the structural pass to an emptied claim
+    if watching then reclaimPass(grid) end
+    return
+  end
+
+  if not onAllItemsTab() then
+    -- a deposit into another tab's placeholder makes the client switch tabs
+    M.Restore()
+    return
+  end
+  if nativeSearchActive() then
+    M.Restore()
+    return
+  end
+  if not claimsValid() then
+    rebuildView()
+    return
+  end
+  refreshCounts()
+
+  -- a placeholder keeps its obj id, so claimsValid cannot see an emptied claim
+  reclaimPass(grid)
+
+  -- Only when the bank holds more of a short item than at build: a wider
+  -- trigger rebuilds on every withdrawal.
+  for _, c in ipairs(view.cells) do
+    if c.missing or c.partial then
+      local now = (view.counts[c.obj] or 0) + (view.counts[c.obj - 1] or 0)
+      local atShow = (c.srcObj ~= nil) and (view.claimQty[c.srcObj] or 0) or 0
+      if now > atShow then
+        rebuildView()
+        return
+      end
+    end
+  end
+
+  updateDisplays()
+  if hotIndex ~= nil then flagCell(view.cells[hotIndex], true) end
+  hideSweep(grid)
+  -- children the client spawns after a withdrawal can land above the canvas
+  pcall(frontCanvas)
+  for _, c in ipairs(view.cells) do
+    if c.sprite ~= nil then pcall(frontSprite, c) end
+  end
+  for _, c in ipairs(view.cells) do
+    if c.label ~= nil then pcall(frontLabel, c) end
+  end
+end
+
+local function onTick()
+  pcall(tickBody)
 end
 
 M.Restore = function()
@@ -886,8 +778,6 @@ M.Restore = function()
   pcall(function() Event.InventoryUpdated.Unsubscribe("pvInvUpd") end)
   unHot()
   if view ~= nil then
-    -- put the display back: un-hide every native we hid (confirmed restore
-    -- path) and reset any quantity override on claimed children
     for _, child in ipairs(view.hiddenChildren) do
       pcall(function() child.hidden = false end)
     end
@@ -900,23 +790,16 @@ M.Restore = function()
         end)
       end
       if c.child ~= nil then
-        flagCell(c, false) -- never leave a left-click override behind
+        flagCell(c, false)
         pcall(function()
-          -- full hand-back: native quantity, native display mode, visible.
-          -- (A child hidden by the hot/unhot cycle may not be in
-          -- hiddenChildren, so un-hide here too.) Position is restored ONLY
-          -- on the All Items tab - off-tab (tab-switch bail) the coords are
-          -- stale and the client re-lays-out the grid itself; forcing them
-          -- stranded the preset's items until the next manual tab switch.
+          -- off the All Items tab these coords are stale and strand the item
           if c.nx ~= nil and onAllItemsTab() then c.child:SetPos(c.nx, c.ny) end
-          -- quantity + mode hand-back is for STACKED claims only: uniques
-          -- are never stamped, and writing anything onto one that emptied
-          -- into a placeholder overwrites the client's own 0 (nativeQty)
           local q = nativeQty(c)
           if q ~= nil then
             c.child.associatedObjectQuantity = q
             c.child.associatedObjectQuantityMode = ui.ObjectQuantityDisplayMode.MULTIPLE
           end
+          -- a child hidden by unHot may not be in hiddenChildren
           c.child.hidden = false
         end)
       end
@@ -930,7 +813,7 @@ M.Restore = function()
   reclaimWatch = 0
   M.activePresetId = nil
   M.activePreset = nil
-  if M.OnViewChanged then pcall(M.OnViewChanged) end
+  fireViewChanged()
 end
 
 M.Show = function(preset, isRebuild)
@@ -939,28 +822,28 @@ M.Show = function(preset, isRebuild)
     log("[PV] bank not open")
     return false
   end
+  -- grid children must not be created before the grid displays
   local displayed = nil
   pcall(function() displayed = grid.visibleGlobal end)
   if displayed ~= true then return false end
   if not onAllItemsTab() then
-    flashAllItemsTab() -- point the user at the tab instead of failing silently
+    flashAllItemsTab()
     return false
   end
-  M.Restore()
+  local hadView = M.activePresetId ~= nil
+  quiet = quiet + 1
+  pcall(M.Restore)
+  quiet = quiet - 1
 
   local ok, err = pcall(function()
     local pools, counts, emptyChildren = scanBank(grid)
-    -- exact layout is read at build time, so a settings toggle only needs
-    -- to Restore + Show to take effect
-    local exact = PersistentDB:GetBool("ui.exactLayout") == true
-    -- the shared model carries cells + geometry + the live-layer lookups
-    -- (equipObjs, claimQty, liveCells); this engine adds its runtime state
+    local exact = prefs.GetBool("ui.exactLayout") == true
     local model = buildCells(preset, pools, counts, carriedCounts(), exact,
       emptyChildren)
     if not ensureCanvas(grid) then error("canvas build failed") end
 
     view = model
-    view.carried = carriedCounts() -- fresh read: the build consumed a copy
+    view.carried = carriedCounts()
     view.counts = counts
     view.pending = {}
     view.hiddenChildren, view.hiddenSet = {}, {}
@@ -976,22 +859,19 @@ M.Show = function(preset, isRebuild)
         c.sprite = s
         pcall(function()
           s:SetPos(c.x, c.y)
-          s:SetSize(36, 32) -- every cell, doll or grid, is the same size
+          s:SetSize(36, 32)
           s:SetAssociatedObject(c.obj)
           s.hidden = false
           s:MoveToFront()
         end)
-        -- badge (a bank-STACKED item shows even "1" - it's a withdraw count,
-        -- which MULTIPLE would hide natively)
         applyCellDisplay(c)
       end
     end
-    -- hide any leftover pooled cells from a larger previous view
     for i = #cells + 1, #cellPool do
       pcall(function() cellPool[i].hidden = true end)
     end
 
-    -- shortfall labels last: they must sit above the cell sprites
+    -- labels last: they must sit above the cell sprites
     local labelIdx = 0
     for _, c in ipairs(cells) do
       if c.shortfall ~= nil and c.shortfall > 0 then
@@ -1004,7 +884,6 @@ M.Show = function(preset, isRebuild)
           pcall(function()
             w = config.Font.FromID(SHORTFALL_FONT):GetStringWidth(txt, false) + 6
           end)
-          -- bottom-left of the slot box, sized to the text
           c.labelX, c.labelY = c.x - 3, c.y + 20
           pcall(function()
             lab.bg:SetPos(c.labelX, c.labelY)
@@ -1038,36 +917,35 @@ M.Show = function(preset, isRebuild)
         pcall(function()
           if ev.inv == nil then return end
           local iid = ev.inv.id
-          -- Bank (95) and all three carried inventories: satisfaction is
-          -- measured against what the player holds, so a transfer or an
-          -- equip swap has to trigger a repair as well.
+          -- the carried inventories too: a transfer or an equip swap changes
+          -- satisfaction without touching the bank
           if iid == 95 or iid == 93 or iid == 94 or iid == 530 then
+            -- repairs run on the tick: the client's re-layout lands after
+            -- this event and would overwrite a repair made here
             forceRepairTicks = 3
-            -- a withdrawal's fresh placeholder can take a few ticks to
-            -- read 0; keep re-checking emptied claims through the window
             reclaimWatch = 15
           end
         end)
       end)
     end)
-    -- Re-arm the cell already under the pointer, ONE TICK from now.
-    -- ONMOUSEOVER only fires on ENTRY, and the emptied-claim re-claim path
-    -- rebuilds the view under a STATIONARY cursor mid-withdraw - without
-    -- this, the next click lands on the un-hot cell sprite and does
-    -- nothing until the pointer moves away and back.
+    -- ONMOUSEOVER fires on entry only, so the cell under a stationary
+    -- pointer is re-armed by hand; next tick, because xyGlobal is still
+    -- the pre-layout value here
     rearmPending = true
   end)
   if not ok then
     log(formatStr("[PV] bank view failed: {}", tostring(err)))
     M.Restore()
+    -- Restore is silent once the view is already gone
+    if hadView and M.activePresetId == nil then fireViewChanged() end
     return false
   end
-  if M.OnViewChanged then pcall(M.OnViewChanged) end
+  fireViewChanged()
   return true
 end
 
--- Drops the canvas and cell pool. Called by main.lua on the open->closed
--- transition, after Restore.
+-- Call after Restore. Needed on bank close (the client detaches plugin
+-- children of bank components) and before handing the grid to Bank Core.
 M.DestroyChrome = function()
   clearGlow()
   for _, s in ipairs(cellPool) do

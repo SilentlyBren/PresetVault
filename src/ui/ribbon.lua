@@ -1,5 +1,5 @@
 -- The ribbon quick-access panel: one "Open vault window" button, or a notice
--- when the BankUtil sidebar owns the UI instead.
+-- when the Bank Core sidebar owns the UI instead.
 local M = {}
 
 local window = require("ui/pvwin")
@@ -19,7 +19,7 @@ M.Build = function(layerComponent)
       { width = w, height = h, categoryID = "auto" })
     view:AddTitle("Preset Vault")
     if bankutil.HasColumn() then
-      view:AddText({ text = "BankUtils (Bankcore) integration is on.",
+      view:AddText({ text = "Bank Core integration is on.",
         colour = 0xB8A169CC })
       view:AddText({ text = "Manage presets in the bank's sidebar.",
         colour = 0xB8A169CC })
