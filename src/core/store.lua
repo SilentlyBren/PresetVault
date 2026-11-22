@@ -131,6 +131,20 @@ local function loadIndex()
   return cacheFor(s).idx, s
 end
 
+-- Every mutator starts from the stored index, not the cached one: another
+-- client on this device may have written it since it was cached.
+local function freshIndex()
+  local s = scope()
+  if s == nil then return nil end
+  rememberLabel(s)
+  if cache == nil or cache.scope ~= s then
+    cacheFor(s)
+  else
+    cache.idx = readIndex(s)
+  end
+  return cache.idx, s
+end
+
 local function readPreset(s, id)
   local c = cacheFor(s)
   local p = c.presets[id]
@@ -142,8 +156,9 @@ local function readPreset(s, id)
 end
 
 -- An id in `ids` with no preset key is skipped, not treated as an error.
-local function loadAll()
-  local idx, s = loadIndex()
+local function loadAll(fresh)
+  local idx, s
+  if fresh then idx, s = freshIndex() else idx, s = loadIndex() end
   if idx == nil then return nil, nil, nil end
   local out = {}
   for _, id in ipairs(idx.ids) do
@@ -191,7 +206,7 @@ end
 -- Both indices must be read before the removal to keep that direction.
 M.ReorderPreset = function(movedId, targetId)
   if movedId == targetId then return end
-  local presets, idx, s = loadAll()
+  local presets, idx, s = loadAll(true)
   if presets == nil then return end
   local order = resolveOrder(idx, presets)
   local from, target
@@ -245,7 +260,7 @@ end
 -- The preset is written before the index: an orphan key is harmless, a
 -- registered id with no data is not.
 local function addPreset(p)
-  local idx, s = loadIndex()
+  local idx, s = freshIndex()
   if idx == nil then return nil end
   p.id = idx.nextId
   idx.nextId = idx.nextId + 1
@@ -278,7 +293,7 @@ M.Import = function(preset)
 end
 
 M.Delete = function(presetId)
-  local idx, s = loadIndex()
+  local idx, s = freshIndex()
   if idx == nil then return end
   for i, id in ipairs(idx.ids) do
     if id == presetId then
@@ -302,8 +317,21 @@ end
 local function editPreset(presetId, fn)
   local s = scope()
   if s == nil then return end
-  local p = readPreset(s, presetId)
-  if p == nil then return end
+  local c = cacheFor(s)
+  local stored = PersistentDB:GetStructuredData(presetKey(s, presetId))
+  if stored == nil then
+    c.presets[presetId] = false
+    return
+  end
+  -- refreshed in place: callers hold the cached record
+  local p = c.presets[presetId]
+  if p then
+    for k in pairs(p) do p[k] = nil end
+    for k, v in pairs(stored) do p[k] = v end
+  else
+    p = stored
+    c.presets[presetId] = p
+  end
   fn(p)
   writeVerified(presetKey(s, presetId), p)
 end
@@ -335,7 +363,7 @@ end
 
 -- A nil iconId clears the icon.
 M.SetCategoryIcon = function(name, iconId)
-  local idx, s = loadIndex()
+  local idx, s = freshIndex()
   if idx == nil then return end
   for _, c in ipairs(idx.categories) do
     if c.name == name then
@@ -350,7 +378,7 @@ end
 -- first.
 M.ReorderCategory = function(name, targetName)
   if name == targetName then return end
-  local idx, s = loadIndex()
+  local idx, s = freshIndex()
   if idx == nil then return end
   local from, target
   for i, c in ipairs(idx.categories) do
@@ -367,7 +395,7 @@ end
 -- must leave the cached index unedited.
 M.MoveCategory = function(name, targetName, below)
   if name == targetName then return end
-  local idx, s = loadIndex()
+  local idx, s = freshIndex()
   if idx == nil then return end
   local from, to
   for i, c in ipairs(idx.categories) do
@@ -383,7 +411,7 @@ end
 
 -- Returns the new category's name, or nil when locked.
 M.AddCategory = function()
-  local idx, s = loadIndex()
+  local idx, s = freshIndex()
   if idx == nil then return nil end
   local taken = {}
   for _, c in ipairs(idx.categories) do taken[c.name] = true end
@@ -398,7 +426,7 @@ M.AddCategory = function()
 end
 
 M.DeleteCategory = function(name)
-  local presets, idx, s = loadAll()
+  local presets, idx, s = loadAll(true)
   if presets == nil then return end
   for i, c in ipairs(idx.categories) do
     if c.name == name then
@@ -421,7 +449,7 @@ M.RenameCategory = function(old, new)
   if new == nil then return end
   new = M.CleanName(new)
   if new == "" or new == old then return end
-  local presets, idx, s = loadAll()
+  local presets, idx, s = loadAll(true)
   if presets == nil then return end
   local from, target
   for i, c in ipairs(idx.categories) do
