@@ -14,8 +14,7 @@ local DECOR_STATICS = { 203, 204 }
 local P = require("core/presetview")
 local invread = require("core/invread")
 local ORIGIN_X, TITLE_Y, ORIGIN_Y = P.ORIGIN_X, P.TITLE_Y, P.ORIGIN_Y
-local PACK_HEADER_Y = P.PACK_HEADER_Y
-local GRID_W, CHROME_W = P.GRID_W, P.CHROME_W
+local GRID_W = P.GRID_W
 local SLOT_BG_DX, SLOT_BG_DY = P.SLOT_BG_DX, P.SLOT_BG_DY
 local BOX = P.BOX
 local DOLL_CX, DOLL_Y = P.DOLL_CX, P.DOLL_Y
@@ -208,12 +207,12 @@ local carriedCounts = invread.Carried
 local nameOf = uikit.ObjName
 
 -- One child may serve several cells; a poolIndex past the pool means no child.
-local function buildCells(preset, pools, counts, carried, exact, emptyChildren)
+local function buildCells(preset, pools, counts, carried, exact, emptyChildren, layout)
   local bank = {}
   for obj, pool in pairs(pools) do
     bank[obj] = { stacks = #pool, units = counts[obj] or 0 }
   end
-  local model = P.Build(preset, bank, carried, exact, nameOf)
+  local model = P.Build(preset, bank, carried, exact, nameOf, layout)
   for _, c in ipairs(model.cells) do
     if c.srcObj ~= nil and c.poolIndex ~= nil then
       local pool = pools[c.srcObj]
@@ -253,7 +252,7 @@ local function drawChrome(v)
   pcall(function()
     local cv = canvas
     -- the whole grid, so natives stay masked at any scroll position
-    local gw, gh = CHROME_W, v.chromeH
+    local gw, gh = v.chromeW, v.chromeH
     pcall(function()
       local grid = getGrid()
       if grid ~= nil then
@@ -267,15 +266,17 @@ local function drawChrome(v)
     -- opaque: masks native art the client re-creates un-hidden after a
     -- withdrawal
     cv:AddRectangle(0, 0, gw, gh, PANEL_COLOUR)
-    local function divider(y, text)
-      cv:AddText(ORIGIN_X - 2, y - 3, text, font, TITLE_COLOUR)
-      cv:AddRectangle(ORIGIN_X, y + 18, GRID_W, 1, DIVIDER_COLOUR)
+    local function divider(x, y, w, text)
+      cv:AddText(x - 2, y - 3, text, font, TITLE_COLOUR)
+      cv:AddRectangle(x, y + 18, w, 1, DIVIDER_COLOUR)
     end
     cv:AddText(ORIGIN_X - 2, TITLE_Y - 3, tostring(v.preset.name or ""),
       font, TITLE_COLOUR)
-    divider(ORIGIN_Y, "Worn")
-    divider(PACK_HEADER_Y, "Backpack")
-    if v.bobHeaderY ~= nil then divider(v.bobHeaderY, "Beast of Burden") end
+    divider(ORIGIN_X, ORIGIN_Y, v.wornW, "Worn")
+    divider(v.packX, v.packHeaderY, v.packW, "Backpack")
+    if v.bobHeaderY ~= nil then
+      divider(ORIGIN_X, v.bobHeaderY, GRID_W, "Beast of Burden")
+    end
     local slotBg = prettyui.Sprites.ITEM_SLOT_BACKGROUND
     for _, c in ipairs(WORN_CONNECTORS) do
       cv:AddSprite(DOLL_CX + c[1], DOLL_Y + c[2], c[3], c[4], c[5], CONNECTOR_TINT)
@@ -839,7 +840,10 @@ M.Show = function(preset, isRebuild)
     local pools, counts, emptyChildren = scanBank(grid)
     local exact = prefs.GetBool("ui.exactLayout") == true
     local model = buildCells(preset, pools, counts, carriedCounts(), exact,
-      emptyChildren)
+      emptyChildren, {
+        beside = prefs.GetBool("ui.packStackOff") == true,
+        tall = prefs.GetBool("ui.packTall") == true,
+      })
     if not ensureCanvas(grid) then error("canvas build failed") end
 
     view = model

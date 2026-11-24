@@ -76,6 +76,10 @@ P.WornPos = function(slotIdx)
 end
 P.PACK_HEADER_Y = P.DOLL_Y + ROW[5] + BOX + 8
 
+P.TALL_COLS = 4
+P.WORN_W = 2 * FAR + BOX + 8
+P.SIDE_GAP = 28
+
 P.PENDING_TTL = 75 -- ticks
 P.BULK_ALL_ABOVE = 500
 
@@ -101,7 +105,13 @@ local CONTAINERS = { "backpack", "equipment", "bob" }
 -- bank[obj] = { stacks, units (never a component's display quantity) };
 -- carried[container][obj] = units; nameOf(objId) = display name.
 -- The order of the returned cells is the satisfaction priority.
-P.Build = function(preset, bank, carried, exact, nameOf)
+-- layout (optional) = { beside = backpack to the right of the doll,
+-- tall = exact backpack as 7 rows of 4 }.
+P.Build = function(preset, bank, carried, exact, nameOf, layout)
+  local beside = layout ~= nil and layout.beside == true
+  local tall = exact == true and layout ~= nil and layout.tall == true
+  local packOriginX = beside and (P.ORIGIN_X + P.WORN_W + P.SIDE_GAP) or P.ORIGIN_X
+  local packHeaderY = beside and P.ORIGIN_Y or P.PACK_HEADER_Y
   local cells = {}
   local claimIdx = {}
   local claimedUnits = {}
@@ -150,7 +160,7 @@ P.Build = function(preset, bank, carried, exact, nameOf)
 
   -- Returns rows used, or nil when a slot is missing, duplicated or out of
   -- range; the caller then builds the section compact.
-  local function addSectionExact(entries, baseY, slotCount)
+  local function addSectionExact(entries, baseX, baseY, slotCount, cols)
     local bySlot = {}
     for _, e in ipairs(entries or {}) do
       local s = tonumber(e.slot)
@@ -159,8 +169,8 @@ P.Build = function(preset, bank, carried, exact, nameOf)
       bySlot[s] = e
     end
     for s = 1, slotCount do
-      local pos = { x = P.PACK_X + ((s - 1) % P.COLS) * P.CELL_W,
-        y = baseY + ((s - 1) // P.COLS) * P.CELL_H }
+      local pos = { x = baseX + ((s - 1) % cols) * P.CELL_W,
+        y = baseY + ((s - 1) // cols) * P.CELL_H }
       local e = bySlot[s]
       if e ~= nil then
         addCell(e, pos, e.count)
@@ -169,12 +179,12 @@ P.Build = function(preset, bank, carried, exact, nameOf)
           { x = pos.x + P.SLOT_BG_DX, y = pos.y + P.SLOT_BG_DY }
       end
     end
-    return math.ceil(slotCount / P.COLS)
+    return math.ceil(slotCount / cols)
   end
 
   -- Per-instance items (several stacks, at most one unit each) get one cell
   -- per unit. units <= stacks keeps a stack beside its own placeholder merged.
-  local function addSection(entries, baseY)
+  local function addSection(entries, baseX, baseY)
     local needByObj, order, nameByObj = {}, {}, {}
     for _, e in ipairs(entries or {}) do
       if needByObj[e.obj] == nil then
@@ -196,7 +206,7 @@ P.Build = function(preset, bank, carried, exact, nameOf)
         end
       end
       for _ = 1, cellCount do
-        local pos = { x = P.PACK_X + (idx % P.COLS) * P.CELL_W,
+        local pos = { x = baseX + (idx % P.COLS) * P.CELL_W,
           y = baseY + (idx // P.COLS) * P.CELL_H }
         local cell = addCell({ obj = obj, name = nameByObj[obj],
           count = cellNeed }, pos, cellNeed)
@@ -207,12 +217,13 @@ P.Build = function(preset, bank, carried, exact, nameOf)
     return math.max(1, math.ceil(idx / P.COLS))
   end
 
-  local function sectionRows(entries, baseY, slotCount)
+  -- Returns rows and the column count actually used.
+  local function sectionRows(entries, baseX, baseY, slotCount, cols)
     if exact and slotCount ~= nil then
-      local rows = addSectionExact(entries, baseY, slotCount)
-      if rows ~= nil then return rows end
+      local rows = addSectionExact(entries, baseX, baseY, slotCount, cols)
+      if rows ~= nil then return rows, cols end
     end
-    return addSection(entries, baseY)
+    return addSection(entries, baseX, baseY), P.COLS
   end
 
   -- raised to the highest entry slot so a mismatched size never hides an item
@@ -230,20 +241,23 @@ P.Build = function(preset, bank, carried, exact, nameOf)
   end
 
   currentSection = "backpack"
-  local packRows = sectionRows(preset.backpack, P.PACK_HEADER_Y + P.SECTION_H, 28)
-  local bobHeaderY, bobRows = nil, 0
+  local packRows, packCols = sectionRows(preset.backpack, packOriginX + 4,
+    packHeaderY + P.SECTION_H, 28, tall and P.TALL_COLS or P.COLS)
+  local bottom = packHeaderY + P.SECTION_H + packRows * P.CELL_H
+  -- beside the doll, whichever of the two is taller sets what follows
+  if beside then bottom = math.max(bottom, P.PACK_HEADER_Y - 6) end
+  local bobHeaderY = nil
   if preset.bob ~= nil and preset.bob.items ~= nil and #preset.bob.items > 0 then
-    bobHeaderY = P.PACK_HEADER_Y + P.SECTION_H + packRows * P.CELL_H + 6
+    bobHeaderY = bottom + 6
     currentSection = "bob"
-    bobRows = sectionRows(preset.bob.items, bobHeaderY + P.SECTION_H, bobSlots)
+    local bobRows = sectionRows(preset.bob.items, P.PACK_X,
+      bobHeaderY + P.SECTION_H, bobSlots, P.COLS)
+    bottom = bobHeaderY + P.SECTION_H + bobRows * P.CELL_H
   end
 
-  local bottom
-  if bobHeaderY ~= nil then
-    bottom = bobHeaderY + P.SECTION_H + bobRows * P.CELL_H
-  else
-    bottom = P.PACK_HEADER_Y + P.SECTION_H + packRows * P.CELL_H
-  end
+  local packW = beside and (packCols * P.CELL_W - 4) or P.GRID_W
+  local chromeW = P.CHROME_W
+  if beside then chromeW = math.max(chromeW, packOriginX + packW + 8) end
 
   -- Both passes are needed: carried units cover their own container's
   -- cells first, then leftovers spill to the other sections.
@@ -295,6 +309,8 @@ P.Build = function(preset, bank, carried, exact, nameOf)
   return {
     preset = preset, cells = cells, placedDoll = placedDoll,
     bobHeaderY = bobHeaderY, chromeH = bottom + 8, emptyBg = emptyBg,
+    packX = packOriginX, packHeaderY = packHeaderY, packW = packW,
+    wornW = beside and P.WORN_W or P.GRID_W, chromeW = chromeW,
     exact = exact == true,
     equipObjs = equipObjs, claimQty = claimQty, liveCells = liveCells,
   }

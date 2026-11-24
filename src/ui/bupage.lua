@@ -473,19 +473,21 @@ local function start()
 end
 
 local function drawChrome(cv, model, view)
-  local w = math.max(P.CHROME_W, view.width or P.CHROME_W)
+  local w = math.max(model.chromeW, view.width or model.chromeW)
   local h = math.max(model.chromeH, view.height or 0)
   cv:SetSize(w, h)
   local font = id.Font.CINZEL_13PT_BOLD
-  local function divider(y, text)
-    cv:AddText(P.ORIGIN_X - 2, y - 3, text, font, P.TITLE_COLOUR)
-    cv:AddRectangle(P.ORIGIN_X, y + 18, P.GRID_W, 1, P.DIVIDER_COLOUR)
+  local function divider(x, y, dw, text)
+    cv:AddText(x - 2, y - 3, text, font, P.TITLE_COLOUR)
+    cv:AddRectangle(x, y + 18, dw, 1, P.DIVIDER_COLOUR)
   end
   cv:AddText(P.ORIGIN_X - 2, P.TITLE_Y - 3, tostring(model.preset.name or ""),
     font, P.TITLE_COLOUR)
-  divider(P.ORIGIN_Y, "Worn")
-  divider(P.PACK_HEADER_Y, "Backpack")
-  if model.bobHeaderY ~= nil then divider(model.bobHeaderY, "Beast of Burden") end
+  divider(P.ORIGIN_X, P.ORIGIN_Y, model.wornW, "Worn")
+  divider(model.packX, model.packHeaderY, model.packW, "Backpack")
+  if model.bobHeaderY ~= nil then
+    divider(P.ORIGIN_X, model.bobHeaderY, P.GRID_W, "Beast of Burden")
+  end
   local slotBg = prettyui.Sprites.ITEM_SLOT_BACKGROUND
   -- connectors first, so slot art covers their ends
   for _, c in ipairs(P.WORN_CONNECTORS) do
@@ -515,7 +517,7 @@ local function drawChrome(cv, model, view)
 end
 
 local function drawLabels(cv, model, view)
-  cv:SetSize(math.max(P.CHROME_W, view.width or P.CHROME_W),
+  cv:SetSize(math.max(model.chromeW, view.width or model.chromeW),
     math.max(model.chromeH, view.height or 0))
   for _, c in ipairs(model.cells) do
     if c.shortfall ~= nil and c.shortfall > 0 then
@@ -551,7 +553,10 @@ M.Draw = function(view)
   local exact = prefs.GetBool("ui.exactLayout") == true
   -- pending is folded in: Core redraws before carried shows the withdrawal
   local model = P.Build(preset, bank, P.FoldPending(carried, pending),
-    exact, nameOf)
+    exact, nameOf, {
+      beside = prefs.GetBool("ui.packStackOff") == true,
+      tall = prefs.GetBool("ui.packTall") == true,
+    })
 
   local canvas = ui.Canvas.new(view.parent)
   canvas:SetPos(0, 0)

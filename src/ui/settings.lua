@@ -71,6 +71,18 @@ M.Build = function(layerComponent)
 
     local noCats = prefs.GetBool("ui.noCategories") == true
 
+    -- an open bank view was built from the old flags
+    local function rebuildBankView()
+      pcall(function()
+        local p = bankpage.activePreset
+        if p ~= nil then
+          bankpage.Restore()
+          bankpage.Show(p, true)
+        end
+        bankutil.Refresh()
+      end)
+    end
+
     -- An unset bool reads false, so a default-on setting stores an opt-out
     -- key and a default-off one stores the flag itself.
     local function onSettingChanged(_, _, changedValue, selected)
@@ -93,17 +105,13 @@ M.Build = function(layerComponent)
           M.ScheduleRebuild()
         elseif changedValue == "wrongslot" then
           prefs.SetBool("ui.wrongSlotOff", selected ~= true)
+        elseif changedValue == "packstack" then
+          prefs.SetBool("ui.packStackOff", selected ~= true)
+          rebuildBankView()
         elseif changedValue == "exactlayout" then
           prefs.SetBool("ui.exactLayout", selected == true)
-          -- an open bank view was built from the old flag
-          pcall(function()
-            local p = bankpage.activePreset
-            if p ~= nil then
-              bankpage.Restore()
-              bankpage.Show(p, true)
-            end
-            bankutil.Refresh()
-          end)
+          rebuildBankView()
+          M.ScheduleRebuild()
         elseif changedValue == "bankutil" then
           prefs.SetBool("ui.bankUtilOff", selected ~= true)
           pcall(function()
@@ -186,10 +194,31 @@ M.Build = function(layerComponent)
       { text = "Discrepancy overlay", value = "overlay",
         selected = prefs.GetBool("ui.overlayOff") ~= true },
       { text = "Wrong-slot guide", value = "wrongslot",
-        selected = prefs.GetBool("ui.wrongSlotOff") ~= true,
+        selected = prefs.GetBool("ui.wrongSlotOff") ~= true
+          and prefs.GetBool("ui.overlayOff") ~= true,
         disabled = prefs.GetBool("ui.overlayOff") == true },
+      { text = "Vertically stack backpack", value = "packstack",
+        selected = prefs.GetBool("ui.packStackOff") ~= true },
       { text = "Exact preset layout in bank", value = "exactlayout",
         selected = prefs.GetBool("ui.exactLayout") == true },
+    }, { onChange = onSettingChanged })
+
+    if prefs.GetBool("ui.exactLayout") == true then
+      local function packLabel()
+        return prefs.GetBool("ui.packTall") == true and "7 rows x 4"
+          or "4 rows x 7"
+      end
+      local packBtn
+      packBtn = gen:AddFancyButton(packLabel(), function()
+        pcall(function()
+          prefs.SetBool("ui.packTall", prefs.GetBool("ui.packTall") ~= true)
+          packBtn:SetText(packLabel())
+          rebuildBankView()
+        end)
+      end, { tooltip = "Backpack arrangement in the exact layout" })
+    end
+
+    gen:AddCheckboxButton({
       { text = "Disable interface sounds", value = "sfxoff",
         selected = prefs.GetBool("ui.sfxOff") == true },
     }, { onChange = onSettingChanged })
